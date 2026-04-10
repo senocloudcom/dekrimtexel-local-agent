@@ -23,13 +23,28 @@ import (
 // Decrypt returns the plaintext for a ciphertext encrypted by the dashboard.
 // keyHex is the 64-char hex AES-256 master key.
 // payload is of the form "iv:ciphertext+tag" (all hex).
+//
+// Backwards compatibility: if the dashboard's AGENT_SECRET_KEY env var was not
+// set when these values were stored, the dashboard's encrypt() function falls
+// back to returning plain text. To handle that case, we detect missing colon
+// or non-hex content and return the value as-is. This is intentionally lax
+// because the alternative (failing all scans) is worse than running with the
+// existing plain-text credentials. Once AGENT_SECRET_KEY is set on the
+// dashboard side, the values should be re-encrypted properly.
 func Decrypt(keyHex, payload string) (string, error) {
 	if payload == "" {
 		return "", nil
 	}
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid payload: expected 'iv:ciphertext' format")
+		// Looks like plain text (no colon separator) — return as-is.
+		// This is the fallback path when the dashboard encrypt() couldn't
+		// actually encrypt because AGENT_SECRET_KEY was missing.
+		return payload, nil
+	}
+	// Verify the iv part looks like hex; if not, treat as plain text containing a colon.
+	if _, err := hex.DecodeString(parts[0]); err != nil {
+		return payload, nil
 	}
 
 	key, err := hex.DecodeString(keyHex)

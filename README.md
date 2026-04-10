@@ -50,6 +50,32 @@ make build-all
 
 ## Install on Windows monitoring PC
 
+### Snelste: één-liner (PowerShell als Administrator)
+
+```powershell
+irm https://raw.githubusercontent.com/senocloudcom/dekrimtexel-local-agent/main/scripts/install.ps1 | iex
+```
+
+Het script doet alles:
+1. Download de laatste binary van GitHub Releases
+2. Installeert in `C:\Program Files\dekrimtexel-agent\`
+3. Vraagt om pairing code (genereer die in Dashboard → Admin → Agents)
+4. Vraagt om agent secret key (Dashboard → Admin → Agents → "Agent secret key tonen")
+5. Registreert als Scheduled Task die auto-start bij boot en restart bij crash
+
+### Met env vars (voor automatisering / scripts)
+
+```powershell
+$env:PAIRING_CODE = "ABCD-EF12"
+$env:TENANT = "dekrim"
+$env:SERVER = "https://ping.senocloud.com"
+irm https://raw.githubusercontent.com/senocloudcom/dekrimtexel-local-agent/main/scripts/install.ps1 | iex
+```
+
+(Je wordt alsnog gevraagd om de secret key te plakken, omdat die nergens moet staan.)
+
+### Handmatig
+
 ```powershell
 # 1. Download latest release
 Invoke-WebRequest `
@@ -68,8 +94,14 @@ C:\Windows\Temp\local-agent.exe set-secret --key <64-hex-char-key>
 # 4. Test scan
 C:\Windows\Temp\local-agent.exe scan
 
-# 5. Install as Windows Service
-C:\Windows\Temp\local-agent.exe install
+# 5. Run foreground (of gebruik install.ps1 voor auto-start)
+C:\Windows\Temp\local-agent.exe run
+```
+
+### Uninstall
+
+```powershell
+irm https://raw.githubusercontent.com/senocloudcom/dekrimtexel-local-agent/main/scripts/uninstall.ps1 | iex
 ```
 
 ## Architecture

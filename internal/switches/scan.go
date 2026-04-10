@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
@@ -62,7 +63,29 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 	client, err := Connect(sw.Host, creds.Username, creds.Password, 15*time.Second)
 	if err != nil {
 		logger.Error("ssh connect failed", "err", err)
-		emit("ssh_connect", fmt.Sprintf("Verbinding mislukt: %v", err), "error")
+		// Categoriseer de error voor een duidelijker bericht in de modal
+		errMsg := err.Error()
+		var userMsg string
+		switch {
+		case strings.Contains(errMsg, "tcp dial") && strings.Contains(errMsg, "timeout"):
+			userMsg = fmt.Sprintf("%s onbereikbaar (TCP timeout) — switch staat uit, niet in netwerk, of firewall blokkeert poort 22", sw.Host)
+		case strings.Contains(errMsg, "tcp dial") && strings.Contains(errMsg, "refused"):
+			userMsg = fmt.Sprintf("%s weigert verbinding (TCP refused) — SSH service is uit op switch", sw.Host)
+		case strings.Contains(errMsg, "no route to host"):
+			userMsg = fmt.Sprintf("%s — geen route naar host (VPN tunnel down of routing probleem)", sw.Host)
+		case strings.Contains(errMsg, "ssh handshake") || strings.Contains(errMsg, "handshake refused"):
+			userMsg = fmt.Sprintf("%s SSH handshake mislukt — switch ondersteunt waarschijnlijk de aangevraagde algorithms niet (oudere firmware?)", sw.Host)
+		case strings.Contains(errMsg, "wait for user prompt") || strings.Contains(errMsg, "wait for password prompt"):
+			userMsg = fmt.Sprintf("%s — switch reageert niet met login prompts (geen CBS350-compatible SSH?)", sw.Host)
+		case strings.Contains(errMsg, "wait for # prompt") || strings.Contains(errMsg, "login may have failed"):
+			userMsg = fmt.Sprintf("%s — login mislukt: SSH credentials klopen niet (check agent_ssh_username/password in dashboard)", sw.Host)
+		case strings.Contains(errMsg, "unable to authenticate"):
+			userMsg = fmt.Sprintf("%s — SSH authentication geweigerd door de switch", sw.Host)
+		default:
+			userMsg = fmt.Sprintf("Verbinding mislukt: %s", errMsg)
+		}
+		emit("ssh_connect", userMsg, "error")
+		emit("complete", fmt.Sprintf("%s: SCAN MISLUKT", sw.Name), "error")
 		return nil, fmt.Errorf("ssh connect: %w", err)
 	}
 	defer client.Close()

@@ -27,6 +27,8 @@ type SSHClient struct {
 	Session *ssh.Session
 	stdin   io.WriteCloser
 	stdout  io.Reader
+	ch      chan readChunk // single read channel filled by one readLoop goroutine
+	done    chan struct{}  // signals readLoop to exit
 }
 
 // Connect opens an SSH connection to a CBS350 switch using the non-standard
@@ -111,7 +113,11 @@ func Connect(host, username, password string, timeout time.Duration) (*SSHClient
 		Session: session,
 		stdin:   stdin,
 		stdout:  stdout,
+		ch:      make(chan readChunk, 32),
+		done:    make(chan struct{}),
 	}
+	// Start the single read loop that all subsequent operations consume from
+	go c.readLoop()
 
 	// Wait for "User Name:" prompt and answer
 	if err := c.readUntil("User Name:", 10*time.Second); err != nil {
@@ -144,11 +150,58 @@ func Connect(host, username, password string, timeout time.Duration) (*SSHClient
 
 // Close ends the SSH session and tcp connection.
 func (c *SSHClient) Close() {
+	if c.done != nil {
+		select {
+		case <-c.done:
+			// already closed
+		default:
+			close(c.done)
+		}
+	}
 	if c.Session != nil {
 		c.Session.Close()
 	}
 	if c.Client != nil {
 		c.Client.Close()
+	}
+}
+
+// readChunk represents one chunk of bytes read from stdout, or an error.
+type readChunk struct {
+	data []byte
+	err  error
+}
+
+// readLoop runs in a single goroutine for the lifetime of the SSHClient,
+// pumping bytes from stdout into c.ch. Multiple operations (Run, readUntil)
+// consume from this channel sequentially. Exits when the session closes
+// or c.done is closed.
+func (c *SSHClient) readLoop() {
+	defer close(c.ch)
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+		n, err := c.stdout.Read(buf)
+		if n > 0 {
+			cp := make([]byte, n)
+			copy(cp, buf[:n])
+			select {
+			case c.ch <- readChunk{data: cp}:
+			case <-c.done:
+				return
+			}
+		}
+		if err != nil {
+			select {
+			case c.ch <- readChunk{err: err}:
+			case <-c.done:
+			}
+			return
+		}
 	}
 }
 
@@ -159,20 +212,29 @@ func (c *SSHClient) Run(cmd string, timeout time.Duration) (string, error) {
 		return "", fmt.Errorf("write cmd: %w", err)
 	}
 
-	buf := make([]byte, 4096)
 	var collected strings.Builder
-	deadline := time.Now().Add(timeout)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
 
-	// Read until prompt or timeout
-	for time.Now().Before(deadline) {
-		c.Client.Conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-		n, err := c.stdout.Read(buf)
-		if n > 0 {
-			chunk := string(buf[:n])
-			collected.WriteString(chunk)
+	for {
+		select {
+		case <-deadline.C:
+			return collected.String(), fmt.Errorf("timeout waiting for prompt after %s", cmd)
+		case chunk, ok := <-c.ch:
+			if !ok {
+				return cleanOutput(cmd, collected.String()), nil
+			}
+			if chunk.err != nil {
+				if chunk.err == io.EOF {
+					return cleanOutput(cmd, collected.String()), nil
+				}
+				return collected.String(), fmt.Errorf("read: %w", chunk.err)
+			}
+			data := string(chunk.data)
+			collected.WriteString(data)
 
 			// Handle paging
-			if strings.Contains(chunk, "More:") || strings.Contains(chunk, "--More--") {
+			if strings.Contains(data, "More:") || strings.Contains(data, "--More--") {
 				c.stdin.Write([]byte(" "))
 				continue
 			}
@@ -182,40 +244,39 @@ func (c *SSHClient) Run(cmd string, timeout time.Duration) (string, error) {
 			if len(lines) > 0 {
 				last := strings.TrimSpace(lines[len(lines)-1])
 				if strings.HasSuffix(last, "#") || strings.HasSuffix(last, ">") {
-					// Strip command echo (first line) and prompt (last line)
 					return cleanOutput(cmd, s), nil
 				}
 			}
 		}
-		if err != nil && err != io.EOF {
-			// Ignore timeout errors, keep reading
-			if !isTimeout(err) {
-				return collected.String(), fmt.Errorf("read: %w", err)
-			}
-		}
 	}
-	return collected.String(), fmt.Errorf("timeout waiting for prompt after %s", cmd)
 }
 
 // readUntil reads stdout until `marker` is seen or timeout.
 func (c *SSHClient) readUntil(marker string, timeout time.Duration) error {
-	buf := make([]byte, 1024)
 	var collected strings.Builder
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c.Client.Conn.SetDeadline(time.Now().Add(500 * time.Millisecond))
-		n, err := c.stdout.Read(buf)
-		if n > 0 {
-			collected.Write(buf[:n])
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("marker %q not found within %s (got: %q)", marker, timeout, collected.String())
+		case chunk, ok := <-c.ch:
+			if !ok {
+				return fmt.Errorf("connection closed before marker %q (got: %q)", marker, collected.String())
+			}
+			if chunk.err != nil && chunk.err != io.EOF {
+				return chunk.err
+			}
+			collected.Write(chunk.data)
 			if strings.Contains(collected.String(), marker) {
 				return nil
 			}
-		}
-		if err != nil && err != io.EOF && !isTimeout(err) {
-			return err
+			if chunk.err == io.EOF {
+				return fmt.Errorf("connection closed before marker %q (got: %q)", marker, collected.String())
+			}
 		}
 	}
-	return fmt.Errorf("marker %q not found within %s (got: %q)", marker, timeout, collected.String())
 }
 
 var moreMarker = regexp.MustCompile(`--More--[\x08 ]*`)

@@ -119,8 +119,8 @@ func Connect(host, username, password string, timeout time.Duration) (*SSHClient
 	// Start the single read loop that all subsequent operations consume from
 	go c.readLoop()
 
-	// Wait for "User Name:" prompt and answer
-	if err := c.readUntil("User Name:", 10*time.Second); err != nil {
+	// Wait for username prompt — CBS350 varianten: "User Name:", "Username:"
+	if err := c.readUntilAny([]string{"User Name:", "Username:", "login:"}, 10*time.Second); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("wait for user prompt: %w", err)
 	}
@@ -129,8 +129,8 @@ func Connect(host, username, password string, timeout time.Duration) (*SSHClient
 		return nil, fmt.Errorf("write username: %w", err)
 	}
 
-	// Wait for "Password:" and answer
-	if err := c.readUntil("Password:", 10*time.Second); err != nil {
+	// Wait for password prompt
+	if err := c.readUntilAny([]string{"Password:", "password:"}, 10*time.Second); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("wait for password prompt: %w", err)
 	}
@@ -267,6 +267,38 @@ func (c *SSHClient) Run(cmd string, timeout time.Duration) (string, error) {
 			data := string(chunk.data)
 			if strings.Contains(data, "More:") || strings.Contains(data, "--More--") {
 				c.stdin.Write([]byte(" "))
+			}
+		}
+	}
+}
+
+// readUntilAny reads stdout until any of the given markers is seen or timeout.
+// Returns nil on success (first matched marker was found).
+func (c *SSHClient) readUntilAny(markers []string, timeout time.Duration) error {
+	var collected strings.Builder
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("none of markers %v found within %s (got: %q)", markers, timeout, collected.String())
+		case chunk, ok := <-c.ch:
+			if !ok {
+				return fmt.Errorf("connection closed before markers %v", markers)
+			}
+			if chunk.err != nil && chunk.err != io.EOF {
+				return chunk.err
+			}
+			collected.Write(chunk.data)
+			s := collected.String()
+			for _, m := range markers {
+				if strings.Contains(s, m) {
+					return nil
+				}
+			}
+			if chunk.err == io.EOF {
+				return fmt.Errorf("connection closed, none of %v found (got: %q)", markers, collected.String())
 			}
 		}
 	}

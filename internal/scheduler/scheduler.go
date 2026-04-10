@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
 )
+
+// Maximum aantal parallelle switch scans (voorkomt DDoS van agent + VPN tunnel)
+const maxParallelScans = 5
 
 // Scheduler orchestrates the runtime loops.
 type Scheduler struct {
@@ -169,21 +173,36 @@ func (s *Scheduler) handleScanTrigger(t api.Trigger) {
 	// We gebruiken de eerste switch_id als plaatshouder omdat het ingest endpoint
 	// een geldige switch_id vereist (de modal toont alleen step+detail, niet switch_id).
 	placeholderID := targets[0].ID
-	s.pushStep(t.ScanID, &placeholderID, "scan_start", fmt.Sprintf("Scan gestart voor %d switch(es)", len(targets)), "running")
+	s.pushStep(t.ScanID, &placeholderID, "scan_start", fmt.Sprintf("Scan gestart voor %d switch(es) (parallel, max %d tegelijk)", len(targets), maxParallelScans), "running")
 
-	// Scan each in a goroutine, but wait for all to complete before ack
+	// Parallel scan met semaphore — voorkomt DDoS van agent + VPN tunnel
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	successes := 0
 	failures := 0
 	var failedSwitches []string
+	sem := make(chan struct{}, maxParallelScans)
+
 	for _, sw := range targets {
-		if err := s.scanOneSwitch(sw, t.ScanID); err != nil {
-			slog.Error("scan failed", "switch", sw.Name, "err", err)
-			failures++
-			failedSwitches = append(failedSwitches, sw.Name)
-		} else {
-			successes++
-		}
+		sw := sw // capture loop variable
+		sem <- struct{}{} // acquire
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }() // release
+			err := s.scanOneSwitch(sw, t.ScanID)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				slog.Error("scan failed", "switch", sw.Name, "err", err)
+				failures++
+				failedSwitches = append(failedSwitches, sw.Name)
+			} else {
+				successes++
+			}
+		}()
 	}
+	wg.Wait()
 
 	// Final summary step (gebruik dezelfde placeholder switch_id)
 	var summary string

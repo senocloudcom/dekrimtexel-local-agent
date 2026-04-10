@@ -14,6 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -35,9 +36,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup logging — stdout (not stderr), because PowerShell colors stderr as
-	// errors which makes the agent look broken even when it's running fine.
-	h := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	// Setup logging — write to BOTH stdout (visible when run interactively)
+	// AND a file (essential when running as a Windows Scheduled Task / Service
+	// where stdout is discarded). Best-effort: if the log file can't be created
+	// we still get stdout-only logging.
+	var logWriter io.Writer = os.Stdout
+	if err := config.EnsureDir(); err == nil {
+		if f, err := os.OpenFile(config.LogFile(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600); err == nil {
+			logWriter = io.MultiWriter(os.Stdout, f)
+			// Don't close f — it lives for the lifetime of the process
+		}
+	}
+	h := slog.NewTextHandler(logWriter, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
 
 	cmd := os.Args[1]

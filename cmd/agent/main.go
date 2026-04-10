@@ -35,8 +35,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup logging
-	h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	// Setup logging — stdout (not stderr), because PowerShell colors stderr as
+	// errors which makes the agent look broken even when it's running fine.
+	h := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
 
 	cmd := os.Args[1]

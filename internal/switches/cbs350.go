@@ -206,20 +206,53 @@ func (c *SSHClient) readLoop() {
 }
 
 // Run sends a single show command and returns the full output (handles paging).
-// Blocks until we see another prompt marker ('#' at end of line) or timeout.
+//
+// Detection strategy: inactivity-based. After sending the command we read until
+// the channel has been silent for `inactivityTimeout`. This is more robust than
+// prompt-detection because CBS350 sometimes prints extra newlines, ANSI escape
+// codes, or otherwise breaks the "ends with #" assumption.
+//
+// Paging is handled by detecting "More:" / "--More--" in any chunk and sending
+// a space character to advance.
 func (c *SSHClient) Run(cmd string, timeout time.Duration) (string, error) {
 	if _, err := c.stdin.Write([]byte(cmd + "\n")); err != nil {
 		return "", fmt.Errorf("write cmd: %w", err)
 	}
 
-	var collected strings.Builder
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
+	const inactivityTimeout = 2 * time.Second
 
+	var collected strings.Builder
+	overallDeadline := time.NewTimer(timeout)
+	defer overallDeadline.Stop()
+
+	// Drain initial 1s burst — give the switch time to start sending
+	initialBurstDone := time.NewTimer(1 * time.Second)
+	for draining := true; draining; {
+		select {
+		case <-initialBurstDone.C:
+			draining = false
+		case chunk, ok := <-c.ch:
+			if !ok {
+				return cleanOutput(cmd, collected.String()), nil
+			}
+			if chunk.err == nil {
+				collected.Write(chunk.data)
+				data := string(chunk.data)
+				if strings.Contains(data, "More:") || strings.Contains(data, "--More--") {
+					c.stdin.Write([]byte(" "))
+				}
+			}
+		}
+	}
+
+	// Now read until inactivity or overall timeout
 	for {
 		select {
-		case <-deadline.C:
-			return collected.String(), fmt.Errorf("timeout waiting for prompt after %s", cmd)
+		case <-overallDeadline.C:
+			return cleanOutput(cmd, collected.String()), nil
+		case <-time.After(inactivityTimeout):
+			// No data for `inactivityTimeout` — assume command is done
+			return cleanOutput(cmd, collected.String()), nil
 		case chunk, ok := <-c.ch:
 			if !ok {
 				return cleanOutput(cmd, collected.String()), nil
@@ -230,22 +263,10 @@ func (c *SSHClient) Run(cmd string, timeout time.Duration) (string, error) {
 				}
 				return collected.String(), fmt.Errorf("read: %w", chunk.err)
 			}
+			collected.Write(chunk.data)
 			data := string(chunk.data)
-			collected.WriteString(data)
-
-			// Handle paging
 			if strings.Contains(data, "More:") || strings.Contains(data, "--More--") {
 				c.stdin.Write([]byte(" "))
-				continue
-			}
-			// Check for prompt ending the output
-			s := collected.String()
-			lines := strings.Split(strings.TrimRight(s, " \r\n"), "\n")
-			if len(lines) > 0 {
-				last := strings.TrimSpace(lines[len(lines)-1])
-				if strings.HasSuffix(last, "#") || strings.HasSuffix(last, ">") {
-					return cleanOutput(cmd, s), nil
-				}
 			}
 		}
 	}

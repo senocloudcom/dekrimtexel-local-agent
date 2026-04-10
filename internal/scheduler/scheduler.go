@@ -5,6 +5,7 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
@@ -19,7 +20,8 @@ type Scheduler struct {
 	Version   string
 	SecretKey string
 
-	config *api.RemoteConfig
+	config         *api.RemoteConfig
+	scanInProgress atomic.Bool // true while a scan is running, prevents duplicate triggers
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -108,11 +110,24 @@ func (s *Scheduler) pollTriggers() {
 		return
 	}
 	for _, t := range triggers {
-		slog.Info("trigger received", "type", t.Type, "scan_id", t.ScanID, "switch_id", t.SwitchID)
 		switch t.Type {
 		case "scan":
-			s.handleScanTrigger(t)
+			// Skip if a scan is already in progress (prevents duplicate work
+			// because triggers are seen on every poll until acked, and a scan
+			// can take minutes for many switches).
+			if !s.scanInProgress.CompareAndSwap(false, true) {
+				slog.Debug("scan already in progress, skipping duplicate trigger", "scan_id", t.ScanID)
+				continue
+			}
+			slog.Info("trigger received", "type", t.Type, "scan_id", t.ScanID, "switch_id", t.SwitchID)
+			// Run the scan in a goroutine so pollTriggers returns quickly
+			// (heartbeats and other triggers can keep flowing during the scan)
+			go func(trigger api.Trigger) {
+				defer s.scanInProgress.Store(false)
+				s.handleScanTrigger(trigger)
+			}(t)
 		case "configure":
+			slog.Info("trigger received", "type", t.Type, "scan_id", t.ScanID)
 			// Fase C-zeta
 			slog.Warn("configure triggers not yet implemented (fase C-zeta)", "scan_id", t.ScanID)
 			_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "configure actions not implemented in this version")

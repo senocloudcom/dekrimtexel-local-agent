@@ -1,5 +1,17 @@
 // Package scheduler runs the main agent loop: heartbeat, trigger polling,
-// periodic scans, config refetch.
+// periodic background scans, and config refetch.
+//
+// Concurrency model (alpha10):
+//   - There is NO global "scan in progress" lock.
+//   - Multiple scan triggers can run in parallel (manual + periodic + per-switch).
+//   - Per-switch concurrency is guarded by a sync.Map-based SwitchLocker so the
+//     same switch is never SSH'd by two goroutines at the same time.
+//   - A shared semaphore (chan struct{} cap=5) caps the total number of
+//     simultaneous SSH sessions across all scans, to avoid DDoS'ing the VPN
+//     tunnel.
+//   - A separate atomic.Bool guards the periodic background scan so we never
+//     start a second periodic scan while the previous one is still running.
+//     Manual triggers are unaffected.
 package scheduler
 
 import (
@@ -11,12 +23,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
 )
 
-// Maximum aantal parallelle switch scans (voorkomt DDoS van agent + VPN tunnel)
-const maxParallelScans = 5
+// Maximum aantal parallelle SSH sessies (voorkomt DDoS van agent + VPN tunnel).
+// Geldt over alle scans samen, niet per scan.
+const maxParallelSSH = 5
 
 // Scheduler orchestrates the runtime loops.
 type Scheduler struct {
@@ -26,8 +41,18 @@ type Scheduler struct {
 	Version   string
 	SecretKey string
 
-	config         *api.RemoteConfig
-	scanInProgress atomic.Bool // true while a scan is running, prevents duplicate triggers
+	config *api.RemoteConfig
+
+	// Per-switch lock — voorkomt dat dezelfde switch tegelijk door twee
+	// scans wordt aangeraakt. Verschillende switches scannen vrolijk parallel.
+	locker SwitchLocker
+
+	// Globale SSH semaphore over alle scans — rate limit op de VPN tunnel.
+	scanSem chan struct{}
+
+	// Voorkomt dat we een tweede periodieke background scan starten terwijl
+	// de vorige nog loopt. Manual scans hebben geen guard nodig.
+	periodicInProgress atomic.Bool
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -38,6 +63,7 @@ func NewScheduler(client *api.Client, hostname, agentType, version, secretKey st
 		AgentType: agentType,
 		Version:   version,
 		SecretKey: secretKey,
+		scanSem:   make(chan struct{}, maxParallelSSH),
 	}
 }
 
@@ -59,6 +85,14 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	configTick := time.NewTicker(time.Duration(intervals.ConfigRefetchSeconds) * time.Second)
 	defer configTick.Stop()
 
+	// Periodic background scan ticker. Default 900s (15 min) uit dashboard config.
+	scanFullSeconds := intervals.ScanFullSeconds
+	if scanFullSeconds <= 0 {
+		scanFullSeconds = 900
+	}
+	scanFullTick := time.NewTicker(time.Duration(scanFullSeconds) * time.Second)
+	defer scanFullTick.Stop()
+
 	// Send initial heartbeat immediately
 	s.sendHeartbeat()
 
@@ -66,6 +100,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		"heartbeat_s", intervals.HeartbeatSeconds,
 		"trigger_poll_s", intervals.TriggerPollSeconds,
 		"config_refetch_s", intervals.ConfigRefetchSeconds,
+		"scan_full_s", scanFullSeconds,
+		"max_parallel_ssh", maxParallelSSH,
 	)
 
 	for {
@@ -83,6 +119,8 @@ func (s *Scheduler) Run(ctx context.Context) error {
 					slog.Error("config refetch failed", "err", err)
 				}
 			}()
+		case <-scanFullTick.C:
+			go s.runPeriodicScan()
 		}
 	}
 }
@@ -109,6 +147,24 @@ func (s *Scheduler) sendHeartbeat() {
 	slog.Debug("heartbeat sent")
 }
 
+// runPeriodicScan starts a full-fleet scan as if it came from the dashboard.
+// Guarded by periodicInProgress to avoid stacking up if a previous periodic
+// scan hasn't finished. Manual triggers are not affected by this guard.
+func (s *Scheduler) runPeriodicScan() {
+	if !s.periodicInProgress.CompareAndSwap(false, true) {
+		slog.Info("periodic scan skipped: previous run still in progress")
+		return
+	}
+	defer s.periodicInProgress.Store(false)
+
+	scanID := "periodic-" + uuid.NewString()
+	slog.Info("periodic scan starting", "scan_id", scanID)
+	s.handleScanTrigger(api.Trigger{
+		Type:   "scan",
+		ScanID: scanID,
+	})
+}
+
 func (s *Scheduler) pollTriggers() {
 	triggers, err := s.Client.GetTriggers()
 	if err != nil {
@@ -118,18 +174,16 @@ func (s *Scheduler) pollTriggers() {
 	for _, t := range triggers {
 		switch t.Type {
 		case "scan":
-			// Skip if a scan is already in progress (prevents duplicate work
-			// because triggers are seen on every poll until acked, and a scan
-			// can take minutes for many switches).
-			if !s.scanInProgress.CompareAndSwap(false, true) {
-				slog.Debug("scan already in progress, skipping duplicate trigger", "scan_id", t.ScanID)
-				continue
-			}
 			slog.Info("trigger received", "type", t.Type, "scan_id", t.ScanID, "switch_id", t.SwitchID)
-			// Run the scan in a goroutine so pollTriggers returns quickly
-			// (heartbeats and other triggers can keep flowing during the scan)
+			// Run elke scan in z'n eigen goroutine. Geen globale lock meer:
+			// per-switch concurrency wordt bewaakt door de SwitchLocker
+			// in handleScanTrigger.
 			go func(trigger api.Trigger) {
-				defer s.scanInProgress.Store(false)
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("scan goroutine panic", "scan_id", trigger.ScanID, "panic", r)
+					}
+				}()
 				s.handleScanTrigger(trigger)
 			}(t)
 		case "configure":
@@ -159,9 +213,9 @@ func (s *Scheduler) handleScanTrigger(t api.Trigger) {
 		}
 		if len(targets) == 0 {
 			slog.Error("switch_id not found in config", "id", *t.SwitchID)
-			// Push een error step met de eerste switch als placeholder
 			placeholderID := s.config.Switches[0].ID
-			s.pushStep(t.ScanID, &placeholderID, "scan_complete", fmt.Sprintf("Switch ID %d niet gevonden in agent config", *t.SwitchID), "error")
+			s.pushStep(t.ScanID, &placeholderID, "scan_complete",
+				fmt.Sprintf("Switch ID %d niet gevonden in agent config", *t.SwitchID), "error")
 			_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "switch not found in config")
 			return
 		}
@@ -171,26 +225,55 @@ func (s *Scheduler) handleScanTrigger(t api.Trigger) {
 
 	// Push initial start step zodat de modal direct iets ziet.
 	// We gebruiken de eerste switch_id als plaatshouder omdat het ingest endpoint
-	// een geldige switch_id vereist (de modal toont alleen step+detail, niet switch_id).
+	// een geldige switch_id vereist (de modal toont alleen step+detail).
 	placeholderID := targets[0].ID
-	s.pushStep(t.ScanID, &placeholderID, "scan_start", fmt.Sprintf("Scan gestart voor %d switch(es) (parallel, max %d tegelijk)", len(targets), maxParallelScans), "running")
+	s.pushStep(t.ScanID, &placeholderID, "scan_start",
+		fmt.Sprintf("Scan gestart voor %d switch(es) (parallel, max %d SSH tegelijk)", len(targets), maxParallelSSH),
+		"running")
 
-	// Parallel scan met semaphore — voorkomt DDoS van agent + VPN tunnel
+	// Parallelle scan met:
+	// - per-switch lock (skip als al bezig door andere scan)
+	// - shared semaphore (cap maxParallelSSH over alle scans)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	successes := 0
 	failures := 0
+	skipped := 0
 	var failedSwitches []string
-	sem := make(chan struct{}, maxParallelScans)
+	var skippedSwitches []string
 
 	for _, sw := range targets {
 		sw := sw // capture loop variable
-		sem <- struct{}{} // acquire
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }() // release
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("scanOneSwitch panic", "switch", sw.Name, "panic", r)
+				}
+			}()
+
+			// Probeer per-switch lock te krijgen
+			if !s.locker.TryLock(sw.ID) {
+				slog.Info("switch already being scanned, skipping", "switch", sw.Name, "scan_id", t.ScanID)
+				swID := sw.ID
+				s.pushStep(t.ScanID, &swID, "skipped",
+					fmt.Sprintf("%s wordt al gescand door een andere taak — overslaan", sw.Name),
+					"warning")
+				mu.Lock()
+				skipped++
+				skippedSwitches = append(skippedSwitches, sw.Name)
+				mu.Unlock()
+				return
+			}
+			defer s.locker.Unlock(sw.ID)
+
+			// Acquire global SSH semaphore (rate limit on VPN)
+			s.scanSem <- struct{}{}
+			defer func() { <-s.scanSem }()
+
 			err := s.scanOneSwitch(sw, t.ScanID)
+
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -204,22 +287,35 @@ func (s *Scheduler) handleScanTrigger(t api.Trigger) {
 	}
 	wg.Wait()
 
-	// Final summary step (gebruik dezelfde placeholder switch_id)
+	// Final summary step
 	var summary string
 	var status string
-	if failures == 0 {
+	switch {
+	case failures == 0 && skipped == 0:
 		summary = fmt.Sprintf("Scan voltooid: %d/%d switches geslaagd", successes, len(targets))
 		status = "done"
-	} else if successes == 0 {
+	case failures == 0 && skipped > 0:
+		skippedList := strings.Join(skippedSwitches, ", ")
+		summary = fmt.Sprintf("Scan voltooid: %d OK, %d overgeslagen (%s)",
+			successes, skipped, skippedList)
+		status = "warning"
+	case successes == 0 && skipped == 0:
 		summary = fmt.Sprintf("Scan MISLUKT: 0/%d switches geslaagd", len(targets))
 		status = "error"
-	} else {
-		failedList := strings.Join(failedSwitches, ", ")
-		summary = fmt.Sprintf("Scan deels gelukt: %d/%d switches OK, %d gefaald (%s)", successes, len(targets), failures, failedList)
+	default:
+		parts := []string{fmt.Sprintf("%d OK", successes)}
+		if failures > 0 {
+			parts = append(parts, fmt.Sprintf("%d gefaald (%s)", failures, strings.Join(failedSwitches, ", ")))
+		}
+		if skipped > 0 {
+			parts = append(parts, fmt.Sprintf("%d overgeslagen (%s)", skipped, strings.Join(skippedSwitches, ", ")))
+		}
+		summary = "Scan deels gelukt: " + strings.Join(parts, ", ")
 		status = "error"
 	}
 	s.pushStep(t.ScanID, &placeholderID, "scan_complete", summary, status)
-	slog.Info("scan finished", "scan_id", t.ScanID, "ok", successes, "failed", failures)
+	slog.Info("scan finished",
+		"scan_id", t.ScanID, "ok", successes, "failed", failures, "skipped", skipped)
 
 	result := "success"
 	errMsg := ""
@@ -233,9 +329,7 @@ func (s *Scheduler) handleScanTrigger(t api.Trigger) {
 }
 
 // pushStep stuurt een enkele scan progress step naar het dashboard.
-// Wordt gebruikt voor scan-niveau steps (start, complete) ipv per switch.
 func (s *Scheduler) pushStep(scanID string, switchID *int, step, detail, status string) {
-	// Use switch_id 0 voor scan-niveau steps zonder specifieke switch
 	swID := 0
 	if switchID != nil {
 		swID = *switchID
@@ -253,7 +347,6 @@ func (s *Scheduler) pushStep(scanID string, switchID *int, step, detail, status 
 		}
 	}()
 }
-
 
 func (s *Scheduler) scanOneSwitch(sw api.SwitchConfig, scanID string) error {
 	creds, err := switches.DecryptCredentials(s.SecretKey, sw.SSHCredentialsEncrypted)

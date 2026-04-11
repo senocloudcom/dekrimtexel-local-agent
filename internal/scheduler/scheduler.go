@@ -99,7 +99,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			go s.sendHeartbeat()
 		case <-pollTick.C:
 			go s.pollJobs()
-			go s.pollTriggers() // legacy backward compat
+			// Legacy pollTriggers UIT in alpha11+ — de dashboard schrijft
+			// nu via scan_jobs queue. Zonder dit zou elke klik dubbel
+			// uitgevoerd worden (één keer als legacy trigger, één keer
+			// als job) en zou de race tussen beide flows tot rare modal
+			// states leiden. De legacy code blijft staan zodat we 'm
+			// later terug kunnen aanzetten als blijkt dat een specifieke
+			// agent versie het nodig heeft.
 		case <-configTick.C:
 			go func() {
 				if err := s.refetchConfig(); err != nil {

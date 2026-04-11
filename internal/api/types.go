@@ -188,3 +188,24 @@ type IngestResponse struct {
 	Processed int    `json:"processed"`
 	Error     string `json:"error,omitempty"`
 }
+
+// SyslogEvent is one parsed syslog message ready to be sent to the dashboard.
+// source_ip is filled by the listener from the UDP packet, not by the parser.
+type SyslogEvent struct {
+	SourceIP      string    `json:"source_ip"`
+	SwitchID      *int      `json:"switch_id,omitempty"`
+	SwitchName    string    `json:"switch_name,omitempty"`
+	Facility      string    `json:"facility,omitempty"`
+	Severity      string    `json:"severity"`
+	SeverityLevel int       `json:"severity_level"`
+	Mnemonic      string    `json:"mnemonic,omitempty"`
+	Interface     string    `json:"interface,omitempty"`
+	Message       string    `json:"message"`
+	RawMessage    string    `json:"raw_message"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
+// SyslogIngestRequest is the shape for POST /v1/ingest/syslog
+type SyslogIngestRequest struct {
+	Events []SyslogEvent `json:"events"`
+}

@@ -22,6 +22,7 @@ import (
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
+	"github.com/senocloudcom/dekrimtexel-local-agent/internal/syslog"
 )
 
 // Maximum aantal parallelle SSH sessies (voorkomt DDoS van agent + VPN tunnel).
@@ -41,6 +42,8 @@ type Scheduler struct {
 	scanSem            chan struct{}
 	periodicInProgress atomic.Bool
 	activeScans        sync.Map // dedupe voor legacy triggers
+
+	syslogListener *syslog.Listener
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -81,6 +84,16 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	defer scanFullTick.Stop()
 
 	s.sendHeartbeat()
+
+	// Start syslog listener if enabled for this agent.
+	if s.config.Agent.Modules.Syslog && s.config.Syslog.Enabled {
+		s.syslogListener = syslog.NewListener(s.config.Syslog, s.Client, s.config.Switches)
+		go func() {
+			if err := s.syslogListener.Run(ctx); err != nil {
+				slog.Error("syslog listener failed", "err", err)
+			}
+		}()
+	}
 
 	slog.Info("scheduler started",
 		"heartbeat_s", intervals.HeartbeatSeconds,
@@ -129,6 +142,10 @@ func (s *Scheduler) refetchConfig() error {
 		"ping_targets", len(cfg.PingTargets),
 		"modules", cfg.Agent.Modules,
 	)
+	// Keep the syslog listener's IP→switch map in sync with the latest config.
+	if s.syslogListener != nil {
+		s.syslogListener.UpdateSwitches(cfg.Switches)
+	}
 	return nil
 }
 

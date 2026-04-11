@@ -159,6 +159,12 @@ func (c *Client) IngestNetwork(data *NetworkIngestRequest) error {
 	return c.do("POST", "/v1/ingest/network", data, &out)
 }
 
+// IngestSyslog sends a batch of parsed syslog events to the dashboard.
+func (c *Client) IngestSyslog(events []SyslogEvent) error {
+	var out IngestResponse
+	return c.do("POST", "/v1/ingest/syslog", SyslogIngestRequest{Events: events}, &out)
+}
+
 // IngestScanProgress sends just scan progress updates (wraps IngestNetwork with minimal fields).
 // Used for live progress updates during a scan so the dashboard modal can show steps in real time.
 func (c *Client) IngestScanProgress(switchID int, switchName string, steps []ScanProgressStep) error {

@@ -112,12 +112,34 @@ type TriggersResponse struct {
 	Triggers []Trigger `json:"triggers"`
 }
 
-// AckTriggerRequest is sent to POST /v1/agent/triggers/ack
+// AckTriggerRequest is sent to POST /v1/agent/triggers/ack (legacy backward compat)
 type AckTriggerRequest struct {
 	ScanID string `json:"scan_id"`
 	Type   string `json:"type"`
 	Result string `json:"result"` // "success" or "failure"
 	Error  string `json:"error,omitempty"`
+}
+
+// Job is a single scan job claimed from the queue.
+type Job struct {
+	ScanID           string    `json:"scan_id"`
+	Scope            string    `json:"scope"` // "all" or "single"
+	TargetSwitchID   *int      `json:"target_switch_id,omitempty"`
+	TargetSwitchName string    `json:"target_switch_name,omitempty"`
+	QueuedAt         time.Time `json:"queued_at"`
+}
+
+// JobsResponse is returned by GET /v1/agent/jobs
+type JobsResponse struct {
+	Jobs []Job `json:"jobs"`
+}
+
+// FinishJobRequest is sent to POST /v1/agent/jobs/[scan_id]/finish
+type FinishJobRequest struct {
+	Result  string                 `json:"result"` // "success" | "partial" | "failure"
+	Counts  map[string]int         `json:"counts,omitempty"`
+	Summary string                 `json:"summary,omitempty"`
+	Error   string                 `json:"error,omitempty"`
 }
 
 // NetworkIngestRequest is the shape for POST /v1/ingest/network

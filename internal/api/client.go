@@ -121,13 +121,35 @@ func (c *Client) GetTriggers() ([]Trigger, error) {
 	return out.Triggers, nil
 }
 
-// AckTrigger marks a trigger as processed.
+// AckTrigger marks a trigger as processed (legacy backward compat for pre-alpha11).
 func (c *Client) AckTrigger(scanID, triggerType, result, errMsg string) error {
 	return c.do("POST", "/v1/agent/triggers/ack", AckTriggerRequest{
 		ScanID: scanID,
 		Type:   triggerType,
 		Result: result,
 		Error:  errMsg,
+	}, nil)
+}
+
+// GetJobs claims and returns up to 5 queued scan jobs from the queue.
+// The server atomically marks them as 'running' so two agents won't grab
+// the same job (FOR UPDATE SKIP LOCKED).
+func (c *Client) GetJobs() ([]Job, error) {
+	var out JobsResponse
+	if err := c.do("GET", "/v1/agent/jobs", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Jobs, nil
+}
+
+// FinishJob reports the final status of a scan job back to the dashboard.
+// Updates the scan_jobs row with status, summary, counts, and (optional) error.
+func (c *Client) FinishJob(scanID, result string, counts map[string]int, summary, errMsg string) error {
+	return c.do("POST", "/v1/agent/jobs/"+scanID+"/finish", FinishJobRequest{
+		Result:  result,
+		Counts:  counts,
+		Summary: summary,
+		Error:   errMsg,
 	}, nil)
 }
 

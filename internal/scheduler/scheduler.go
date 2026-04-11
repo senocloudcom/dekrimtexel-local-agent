@@ -53,6 +53,13 @@ type Scheduler struct {
 	// Voorkomt dat we een tweede periodieke background scan starten terwijl
 	// de vorige nog loopt. Manual scans hebben geen guard nodig.
 	periodicInProgress atomic.Bool
+
+	// activeScans dedupliceert triggers met dezelfde scan_id. Het triggers
+	// endpoint blijft dezelfde scan_id retourneren totdat hij ge-acked wordt,
+	// dus zonder deze guard zou elke 10s een NIEUWE handleScanTrigger
+	// goroutine starten voor dezelfde scan en zouden ze elkaars switch-locks
+	// blokkeren. We slaan scan_id strings op in een sync.Map.
+	activeScans sync.Map
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -174,11 +181,16 @@ func (s *Scheduler) pollTriggers() {
 	for _, t := range triggers {
 		switch t.Type {
 		case "scan":
+			// Dedupliceer op scan_id. Het triggers endpoint blijft dezelfde
+			// scan_id terugsturen totdat we 'm acken, dus zonder deze guard
+			// zouden we elke poll opnieuw beginnen.
+			if _, alreadyRunning := s.activeScans.LoadOrStore(t.ScanID, struct{}{}); alreadyRunning {
+				slog.Debug("scan already running, skipping duplicate poll", "scan_id", t.ScanID)
+				continue
+			}
 			slog.Info("trigger received", "type", t.Type, "scan_id", t.ScanID, "switch_id", t.SwitchID)
-			// Run elke scan in z'n eigen goroutine. Geen globale lock meer:
-			// per-switch concurrency wordt bewaakt door de SwitchLocker
-			// in handleScanTrigger.
 			go func(trigger api.Trigger) {
+				defer s.activeScans.Delete(trigger.ScanID)
 				defer func() {
 					if r := recover(); r != nil {
 						slog.Error("scan goroutine panic", "scan_id", trigger.ScanID, "panic", r)

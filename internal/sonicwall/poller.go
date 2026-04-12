@@ -5,12 +5,12 @@ package sonicwall
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"strings"
 	"time"
 
@@ -29,7 +29,6 @@ type deviceState struct {
 	cfg         api.SonicwallDevice
 	username    string
 	password    string
-	authToken   string
 	httpClient  *http.Client
 }
 
@@ -48,13 +47,14 @@ func (p *Poller) UpdateDevices(devices []api.SonicwallDevice) error {
 			continue
 		}
 		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // SonicWall gebruikt vaak self-signed
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}
+		jar, _ := cookiejar.New(nil)
 		newStates = append(newStates, deviceState{
 			cfg:        d,
 			username:   creds.Username,
 			password:   creds.Password,
-			httpClient: &http.Client{Transport: transport, Timeout: 15 * time.Second},
+			httpClient: &http.Client{Transport: transport, Timeout: 30 * time.Second, Jar: jar},
 		})
 	}
 	p.devices = newStates
@@ -100,8 +100,16 @@ func (p *Poller) pollLoop(ctx context.Context, d *deviceState) {
 func (p *Poller) pollDevice(d *deviceState) {
 	logger := slog.With("sonicwall", d.cfg.Name, "host", d.cfg.Host)
 
-	// Authenticate (try to get token)
-	_ = d.authenticate()
+	// Authenticate: login + start-management (required on SonicOS 7.x)
+	if err := d.login(); err != nil {
+		logger.Error("login failed", "err", err)
+		return
+	}
+	if err := d.startManagement(); err != nil {
+		logger.Warn("start-management failed (maybe already in mgmt)", "err", err)
+	}
+	// Always try to logout at the end to free the session slot
+	defer d.logout()
 
 	var deviceInfo map[string]interface{}
 	vpnTunnels := []map[string]interface{}{}
@@ -110,31 +118,38 @@ func (p *Poller) pollDevice(d *deviceState) {
 	topThreats := []map[string]interface{}{}
 	var haInfo map[string]interface{}
 
-	// System status
-	if res := d.get("/reporting/system/status"); res != nil {
+	// System status — correct path on SonicOS 7.3+ NSA
+	if res := d.get("/reporting/status/system"); res != nil {
 		deviceInfo = map[string]interface{}{
-			"name":     d.cfg.Name,
-			"model":    firstNonEmpty(getNested(res, "firmware", "model"), getNested(res, "model")),
-			"firmware": firstNonEmpty(getNested(res, "firmware", "version"), getNested(res, "firmware_version")),
+			"name":     firstNonEmpty(getNested(res, "firewall_name"), d.cfg.Name),
+			"model":    getNested(res, "model"),
+			"firmware": getNested(res, "firmware_version"),
 			"serial":   getNested(res, "serial_number"),
-			"uptime":   getNested(res, "uptime_seconds", "uptime"),
+			"uptime":   getNested(res, "up_time"),
+		}
+		// current_connections is a string like "Current: 6374" — extract number
+		if s := getString(res, "current_connections"); s != "" {
+			parts := strings.Split(s, ":")
+			if len(parts) == 2 {
+				metrics["connections"] = strings.TrimSpace(parts[1])
+			}
+		}
+		if usage := getString(res, "connection_usage"); usage != "" {
+			metrics["connection_usage"] = usage
 		}
 	}
 
-	// Performance
-	if res := d.get("/reporting/system/resource"); res != nil {
-		metrics["cpu_percent"] = firstNonEmpty(getNested(res, "cpu", "usage"), getNested(res, "cpu_usage"))
-		metrics["ram_percent"] = firstNonEmpty(getNested(res, "memory", "usage"), getNested(res, "memory_usage"))
+	// CPU / memory usage (may or may not exist — try and ignore)
+	if res := d.get("/reporting/status/cpu"); res != nil {
+		metrics["cpu_percent"] = firstNonEmpty(getNested(res, "usage"), getNested(res, "cpu_usage"))
 	}
-
-	// Connections
-	if res := d.get("/reporting/current-connection-count"); res != nil {
-		metrics["connections"] = firstNonEmpty(getNested(res, "count"), getNested(res, "current_connections"))
+	if res := d.get("/reporting/status/memory"); res != nil {
+		metrics["ram_percent"] = firstNonEmpty(getNested(res, "usage"), getNested(res, "memory_usage"))
 	}
 
 	// VPN tunnels
-	if res := d.get("/reporting/vpn/sa-statistics"); res != nil {
-		tunnels := extractList(res, "sa_statistics", "tunnels")
+	if res := d.get("/reporting/vpn/ipsec/active-tunnels"); res != nil {
+		tunnels := extractList(res, "active_tunnels", "tunnels", "sa_statistics")
 		for _, t := range tunnels {
 			status := "inactive"
 			if getBool(t, "active") || getString(t, "status") == "active" {
@@ -151,10 +166,17 @@ func (p *Poller) pollDevice(d *deviceState) {
 		}
 	}
 
-	// Interfaces
-	if res := d.get("/reporting/interfaces/statistics"); res != nil {
+	// Interfaces — try multiple paths
+	for _, path := range []string{"/reporting/status/interfaces", "/reporting/interfaces/statistics"} {
+		res := d.get(path)
+		if res == nil {
+			continue
+		}
 		var totalIn, totalOut float64
 		ifaces := extractList(res, "interfaces")
+		if len(ifaces) == 0 {
+			continue
+		}
 		for _, iface := range ifaces {
 			rxKbps := getFloat(iface, "rx_rate_kbps")
 			txKbps := getFloat(iface, "tx_rate_kbps")
@@ -176,43 +198,31 @@ func (p *Poller) pollDevice(d *deviceState) {
 			"in_mbps":  round1(totalIn / 1024),
 			"out_mbps": round1(totalOut / 1024),
 		}
+		break
 	}
 
-	// Threat prevention
-	if res := d.get("/reporting/threat-prevention/summary"); res != nil {
-		metrics["threats_blocked_today"] = firstNonEmpty(
-			getNested(res, "blocked_today"), getNested(res, "total_blocked"),
-			getNested(res, "intrusions_prevented"))
-	}
-
-	// Top threats (NSA 3700)
-	if res := d.get("/reporting/threats/top"); res != nil {
-		threats := extractList(res, "threats")
-		for i, t := range threats {
-			if i >= 10 {
-				break
+	// Threat / GAV / IPS / CFS — try multiple paths, ignore failures
+	for _, ep := range []struct {
+		path    string
+		metric  string
+		keys    []string
+	}{
+		{"/reporting/status/threat-prevention", "threats_blocked_today", []string{"blocked_today", "total_blocked"}},
+		{"/reporting/status/gateway-anti-virus", "viruses_blocked", []string{"viruses_blocked", "blocked"}},
+		{"/reporting/status/intrusion-prevention", "intrusions_blocked", []string{"intrusions_blocked", "blocked"}},
+		{"/reporting/status/content-filter", "websites_blocked", []string{"websites_blocked", "blocked"}},
+	} {
+		if res := d.get(ep.path); res != nil {
+			vals := make([]interface{}, len(ep.keys))
+			for i, k := range ep.keys {
+				vals[i] = getNested(res, k)
 			}
-			topThreats = append(topThreats, map[string]interface{}{
-				"name":     firstNonEmpty(getNested(t, "name"), getNested(t, "threat_name")),
-				"count":    firstNonEmpty(getNested(t, "count"), getNested(t, "hits")),
-				"category": getString(t, "category"),
-			})
+			metrics[ep.metric] = firstNonEmpty(vals...)
 		}
 	}
 
-	// GAV / IPS / Content Filter
-	if res := d.get("/reporting/security-services/gateway-anti-virus"); res != nil {
-		metrics["viruses_blocked"] = firstNonEmpty(getNested(res, "viruses_blocked"), getNested(res, "blocked"))
-	}
-	if res := d.get("/reporting/security-services/intrusion-prevention"); res != nil {
-		metrics["intrusions_blocked"] = firstNonEmpty(getNested(res, "intrusions_blocked"), getNested(res, "blocked"))
-	}
-	if res := d.get("/reporting/security-services/content-filtering"); res != nil {
-		metrics["websites_blocked"] = firstNonEmpty(getNested(res, "websites_blocked"), getNested(res, "blocked"))
-	}
-
 	// HA status
-	if res := d.get("/reporting/high-availability/status"); res != nil {
+	if res := d.get("/reporting/status/ha"); res != nil {
 		if state := getString(res, "state"); state != "" {
 			haInfo = map[string]interface{}{
 				"state":       state,
@@ -259,8 +269,8 @@ func (d *deviceState) url(path string) string {
 	return fmt.Sprintf("https://%s:%d/api/sonicos%s", d.cfg.Host, port, path)
 }
 
-func (d *deviceState) authenticate() error {
-	body := fmt.Sprintf(`{"user":%q,"password":%q}`, d.username, d.password)
+func (d *deviceState) login() error {
+	body := fmt.Sprintf(`{"user":%q,"password":%q,"override":true}`, d.username, d.password)
 	req, _ := http.NewRequest("POST", d.url("/auth"), strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -271,12 +281,34 @@ func (d *deviceState) authenticate() error {
 	defer res.Body.Close()
 	b, _ := io.ReadAll(res.Body)
 	var data map[string]interface{}
-	if err := json.Unmarshal(b, &data); err == nil {
-		if tok, ok := data["token"].(string); ok {
-			d.authToken = tok
-		}
+	if err := json.Unmarshal(b, &data); err != nil {
+		return fmt.Errorf("parse login: %w", err)
+	}
+	if !isSuccess(data) {
+		return fmt.Errorf("login rejected: %s", extractMessage(data))
 	}
 	return nil
+}
+
+func (d *deviceState) startManagement() error {
+	req, _ := http.NewRequest("POST", d.url("/start-management"), nil)
+	req.Header.Set("Accept", "application/json")
+	res, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	io.ReadAll(res.Body)
+	return nil
+}
+
+func (d *deviceState) logout() {
+	req, _ := http.NewRequest("DELETE", d.url("/auth"), nil)
+	res, err := d.httpClient.Do(req)
+	if err == nil {
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
 }
 
 func (d *deviceState) get(path string) map[string]interface{} {
@@ -285,23 +317,51 @@ func (d *deviceState) get(path string) map[string]interface{} {
 		return nil
 	}
 	req.Header.Set("Accept", "application/json")
-	if d.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+d.authToken)
-	} else {
-		auth := base64.StdEncoding.EncodeToString([]byte(d.username + ":" + d.password))
-		req.Header.Set("Authorization", "Basic "+auth)
-	}
 	res, err := d.httpClient.Do(req)
 	if err != nil {
 		return nil
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 400 {
+		return nil
+	}
 	var data map[string]interface{}
 	if err := json.Unmarshal(b, &data); err != nil {
 		return nil
 	}
+	// Reject error wrappers: {"status":{"success":false, ...}}
+	if status, ok := data["status"].(map[string]interface{}); ok {
+		if success, ok := status["success"].(bool); ok && !success {
+			return nil
+		}
+	}
 	return data
+}
+
+func isSuccess(data map[string]interface{}) bool {
+	status, ok := data["status"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	success, _ := status["success"].(bool)
+	return success
+}
+
+func extractMessage(data map[string]interface{}) string {
+	status, ok := data["status"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	info, ok := status["info"].([]interface{})
+	if !ok || len(info) == 0 {
+		return ""
+	}
+	first, ok := info[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return getString(first, "message")
 }
 
 // --- JSON helpers ---

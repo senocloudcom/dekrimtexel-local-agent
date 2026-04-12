@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
+	"github.com/senocloudcom/dekrimtexel-local-agent/internal/sonicwall"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/syslog"
 )
@@ -43,7 +44,8 @@ type Scheduler struct {
 	periodicInProgress atomic.Bool
 	activeScans        sync.Map // dedupe voor legacy triggers
 
-	syslogListener *syslog.Listener
+	syslogListener  *syslog.Listener
+	sonicwallPoller *sonicwall.Poller
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -95,6 +97,18 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Start SonicWall poller if devices are configured
+	if len(s.config.SonicwallDevices) > 0 {
+		s.sonicwallPoller = sonicwall.NewPoller(s.Client, s.SecretKey)
+		if err := s.sonicwallPoller.UpdateDevices(s.config.SonicwallDevices); err == nil {
+			go func() {
+				if err := s.sonicwallPoller.Run(ctx); err != nil {
+					slog.Error("sonicwall poller failed", "err", err)
+				}
+			}()
+		}
+	}
+
 	slog.Info("scheduler started",
 		"heartbeat_s", intervals.HeartbeatSeconds,
 		"poll_s", intervals.TriggerPollSeconds,
@@ -143,6 +157,10 @@ func (s *Scheduler) refetchConfig() error {
 	// Keep the syslog listener's IP→switch map in sync with the latest config.
 	if s.syslogListener != nil {
 		s.syslogListener.UpdateSwitches(cfg.Switches)
+	}
+	// Keep sonicwall poller in sync
+	if s.sonicwallPoller != nil {
+		_ = s.sonicwallPoller.UpdateDevices(cfg.SonicwallDevices)
 	}
 	return nil
 }

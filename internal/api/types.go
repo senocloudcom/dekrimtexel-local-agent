@@ -27,11 +27,12 @@ type HeartbeatRequest struct {
 
 // RemoteConfig is returned by GET /v1/agent/config
 type RemoteConfig struct {
-	Agent       AgentInfo      `json:"agent"`
-	Switches    []SwitchConfig `json:"switches"`
-	PingTargets []PingTarget   `json:"ping_targets"`
-	Syslog      SyslogConfig   `json:"syslog"`
-	Crypto      CryptoInfo     `json:"crypto"`
+	Agent            AgentInfo         `json:"agent"`
+	Switches         []SwitchConfig    `json:"switches"`
+	PingTargets      []PingTarget      `json:"ping_targets"`
+	SonicwallDevices []SonicwallDevice `json:"sonicwall_devices"`
+	Syslog           SyslogConfig      `json:"syslog"`
+	Crypto           CryptoInfo        `json:"crypto"`
 }
 
 type AgentInfo struct {
@@ -54,6 +55,7 @@ type AgentModules struct {
 	Switch       bool `json:"switch"`
 	Ping         bool `json:"ping"`
 	Syslog       bool `json:"syslog"`
+	Sonicwall    bool `json:"sonicwall"`
 	WriteActions bool `json:"write_actions"`
 }
 
@@ -87,6 +89,16 @@ type SyslogConfig struct {
 	Enabled       bool   `json:"enabled"`
 	Port          int    `json:"port"`
 	ListenAddress string `json:"listen_address"`
+}
+
+// SonicwallDevice is a firewall to poll via REST API
+type SonicwallDevice struct {
+	ID                     int                     `json:"id"`
+	Host                   string                  `json:"host"`
+	Port                   int                     `json:"port"`
+	Name                   string                  `json:"name"`
+	PollInterval           int                     `json:"poll_interval"`
+	CredentialsEncrypted   SSHCredentialsEncrypted `json:"credentials_encrypted"`
 }
 
 type CryptoInfo struct {

@@ -112,13 +112,11 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			go s.sendHeartbeat()
 		case <-pollTick.C:
 			go s.pollJobs()
-			// Legacy pollTriggers UIT in alpha11+ — de dashboard schrijft
-			// nu via scan_jobs queue. Zonder dit zou elke klik dubbel
-			// uitgevoerd worden (één keer als legacy trigger, één keer
-			// als job) en zou de race tussen beide flows tot rare modal
-			// states leiden. De legacy code blijft staan zodat we 'm
-			// later terug kunnen aanzetten als blijkt dat een specifieke
-			// agent versie het nodig heeft.
+			// Legacy pollTriggers alleen voor configure actions — scan
+			// triggers gaan via scan_jobs queue (alpha11+). Configure
+			// triggers hebben (nog) geen eigen queue en gebruiken het
+			// legacy agent_config systeem.
+			go s.pollConfigureTriggers()
 		case <-configTick.C:
 			go func() {
 				if err := s.refetchConfig(); err != nil {
@@ -364,35 +362,34 @@ func (s *Scheduler) handleJob(j api.Job) {
 	}
 }
 
-// pollTriggers is de LEGACY flow voor pre-alpha11 dashboards. Kan na 1-2
-// weken weg als alle dashboards via scan_jobs werken.
-func (s *Scheduler) pollTriggers() {
+// pollConfigureTriggers polls legacy triggers but only handles configure
+// actions. Scan triggers are handled by the jobs system (pollJobs).
+func (s *Scheduler) pollConfigureTriggers() {
 	triggers, err := s.Client.GetTriggers()
 	if err != nil {
-		slog.Debug("legacy trigger poll failed", "err", err)
+		slog.Debug("configure trigger poll failed", "err", err)
 		return
 	}
 	for _, t := range triggers {
 		switch t.Type {
 		case "scan":
+			// Scan triggers worden afgehandeld door pollJobs — skip hier.
+			// ACK zodat de trigger niet blijft hangen.
+			_ = s.Client.AckTrigger(t.ScanID, t.Type, "success", "handled by jobs system")
+		case "configure":
 			if _, alreadyRunning := s.activeScans.LoadOrStore(t.ScanID, struct{}{}); alreadyRunning {
-				slog.Debug("legacy scan already running, skipping duplicate poll", "scan_id", t.ScanID)
 				continue
 			}
-			slog.Info("legacy trigger received", "type", t.Type, "scan_id", t.ScanID, "switch_id", t.SwitchID)
+			slog.Info("configure trigger received", "action", t.Action, "scan_id", t.ScanID, "switches", len(t.SwitchIDs))
 			go func(trigger api.Trigger) {
 				defer s.activeScans.Delete(trigger.ScanID)
 				defer func() {
 					if r := recover(); r != nil {
-						slog.Error("legacy scan goroutine panic", "scan_id", trigger.ScanID, "panic", r)
+						slog.Error("configure goroutine panic", "scan_id", trigger.ScanID, "panic", r)
 					}
 				}()
-				s.handleLegacyTrigger(trigger)
+				s.handleConfigureTrigger(trigger)
 			}(t)
-		case "configure":
-			slog.Info("legacy trigger received", "type", t.Type, "scan_id", t.ScanID)
-			slog.Warn("configure triggers not yet implemented (fase C-zeta)", "scan_id", t.ScanID)
-			_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "configure actions not implemented in this version")
 		}
 	}
 }
@@ -410,6 +407,115 @@ func (s *Scheduler) handleLegacyTrigger(t api.Trigger) {
 	}
 	if err := s.Client.AckTrigger(t.ScanID, t.Type, result, errMsg); err != nil {
 		slog.Error("legacy ack failed", "err", err)
+	}
+}
+
+// handleConfigureTrigger verwerkt een configure action (syslog, PNP, show, VLAN).
+func (s *Scheduler) handleConfigureTrigger(t api.Trigger) {
+	if s.config == nil {
+		_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "no config loaded")
+		return
+	}
+
+	// Decrypt SSH credentials from the trigger
+	var creds switches.Credentials
+	if t.SSHCredentialsEncrypted != nil {
+		var err error
+		creds, err = switches.DecryptCredentials(s.SecretKey, *t.SSHCredentialsEncrypted)
+		if err != nil {
+			slog.Error("decrypt configure credentials failed", "err", err)
+			s.pushStep(t.ScanID, nil, "error", fmt.Sprintf("Credentials decryptie mislukt: %s", err), "error")
+			_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "credential decryption failed")
+			return
+		}
+	} else {
+		// Fallback: use credentials from config (for run_show_command)
+		if len(s.config.Switches) > 0 {
+			var err error
+			creds, err = switches.DecryptCredentials(s.SecretKey, s.config.Switches[0].SSHCredentialsEncrypted)
+			if err != nil {
+				_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "no credentials available")
+				return
+			}
+		}
+	}
+
+	// Find target switches
+	switchMap := make(map[int]api.SwitchConfig)
+	for _, sw := range s.config.Switches {
+		switchMap[sw.ID] = sw
+	}
+
+	var targets []api.SwitchConfig
+	for _, id := range t.SwitchIDs {
+		if sw, ok := switchMap[id]; ok {
+			targets = append(targets, sw)
+		}
+	}
+
+	if len(targets) == 0 {
+		slog.Error("no valid target switches found", "ids", t.SwitchIDs)
+		_ = s.Client.AckTrigger(t.ScanID, t.Type, "failure", "no valid target switches")
+		return
+	}
+
+	placeholderID := targets[0].ID
+	s.pushStep(t.ScanID, &placeholderID, "configure_start",
+		fmt.Sprintf("Configuratie gestart: %s op %d switch(es)", t.Action, len(targets)),
+		"running")
+
+	progress := func(step api.ScanProgressStep) {
+		swID := 0
+		if step.SwitchID != nil {
+			swID = *step.SwitchID
+		}
+		go func() {
+			if err := s.Client.IngestScanProgress(swID, "", []api.ScanProgressStep{step}); err != nil {
+				slog.Warn("configure progress push failed", "err", err)
+			}
+		}()
+	}
+
+	// Execute on each switch (sequentially for write safety)
+	var successes, failures int
+	var failedNames []string
+
+	for _, sw := range targets {
+		// Acquire SSH semaphore
+		s.scanSem <- struct{}{}
+
+		result := switches.ExecuteConfigureAction(t.Action, sw, creds, t.Params, t.ScanID, progress)
+
+		<-s.scanSem
+
+		if result.Success {
+			successes++
+		} else {
+			failures++
+			failedNames = append(failedNames, sw.Name)
+		}
+	}
+
+	// Summary
+	var ackResult, ackError string
+	if failures == 0 {
+		ackResult = "success"
+		s.pushStep(t.ScanID, &placeholderID, "configure_complete",
+			fmt.Sprintf("Configuratie voltooid: %d/%d switches geslaagd", successes, len(targets)),
+			"done")
+	} else if successes == 0 {
+		ackResult = "failure"
+		ackError = fmt.Sprintf("Alle %d switches mislukt: %s", failures, strings.Join(failedNames, ", "))
+		s.pushStep(t.ScanID, &placeholderID, "configure_complete", ackError, "error")
+	} else {
+		ackResult = "success"
+		ackError = fmt.Sprintf("%d OK, %d mislukt (%s)", successes, failures, strings.Join(failedNames, ", "))
+		s.pushStep(t.ScanID, &placeholderID, "configure_complete",
+			fmt.Sprintf("Configuratie deels geslaagd: %s", ackError), "warning")
+	}
+
+	if err := s.Client.AckTrigger(t.ScanID, t.Type, ackResult, ackError); err != nil {
+		slog.Error("configure ack failed", "err", err)
 	}
 }
 

@@ -155,7 +155,42 @@ type NetworkIngestRequest struct {
 	FirmwareChanged bool                   `json:"firmware_changed,omitempty"`
 	PortStates      []PortState            `json:"port_states,omitempty"`
 	Topology        []TopologyEntry        `json:"topology,omitempty"`
+	MACTable        []MACEntry             `json:"mac_table,omitempty"`
+	PoEStatus       []PoEPortStatus        `json:"poe_status,omitempty"`
+	InterfaceStats  []InterfaceStat        `json:"interface_stats,omitempty"`
 	ScanProgress    []ScanProgressStep     `json:"scan_progress,omitempty"`
+}
+
+// MACEntry is one row from `show mac address-table`
+type MACEntry struct {
+	VLAN       int    `json:"vlan"`
+	MACAddress string `json:"mac_address"`
+	Port       string `json:"port"`
+	Type       string `json:"type,omitempty"` // dynamic, static, management
+}
+
+// PoEPortStatus is one row from `show power inline`
+type PoEPortStatus struct {
+	Port         string  `json:"port"`
+	Enabled      bool    `json:"enabled"`
+	Status       string  `json:"status,omitempty"` // on, off, searching, fault
+	PowerWatts   float64 `json:"power_watts,omitempty"`
+	Class        string  `json:"class,omitempty"`
+	Priority     string  `json:"priority,omitempty"`
+	DeviceType   string  `json:"device_type,omitempty"`
+}
+
+// InterfaceStat is per-port counter data from `show interfaces counters`
+type InterfaceStat struct {
+	Port           string `json:"port"`
+	InOctets       int64  `json:"in_octets,omitempty"`
+	OutOctets      int64  `json:"out_octets,omitempty"`
+	InErrors       int64  `json:"in_errors,omitempty"`
+	OutErrors      int64  `json:"out_errors,omitempty"`
+	CRCErrors      int64  `json:"crc_errors,omitempty"`
+	Collisions     int64  `json:"collisions,omitempty"`
+	InDiscards     int64  `json:"in_discards,omitempty"`
+	OutDiscards    int64  `json:"out_discards,omitempty"`
 }
 
 type PortState struct {

@@ -99,16 +99,22 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 			"show version",
 			"show interfaces status",
 			"show lldp neighbors",
+			"show mac address-table",
+			"show power inline",
+			"show interfaces counters",
 		}
 	}
 
 	rawData := make(map[string]interface{})
 	var portStates []api.PortState
 	var topology []api.TopologyEntry
+	var macTable []api.MACEntry
+	var poeStatus []api.PoEPortStatus
+	var interfaceStats []api.InterfaceStat
 
 	for _, cmd := range commands {
 		emit("run_command", fmt.Sprintf("> %s", cmd), "running")
-		output, err := client.Run(cmd, 20*time.Second)
+		output, err := client.Run(cmd, 30*time.Second)
 		if err != nil {
 			logger.Warn("command failed", "cmd", cmd, "err", err)
 			emit("run_command", fmt.Sprintf("Command '%s' faalde: %v", cmd, err), "error")
@@ -124,26 +130,36 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 			portStates = ParsePortStatus(output)
 		case "show lldp neighbors":
 			topology = ParseLLDPNeighbors(output)
+		case "show mac address-table", "show mac-address-table":
+			macTable = ParseMACTable(output)
+		case "show power inline":
+			poeStatus = ParsePoEStatus(output)
+		case "show interfaces counters", "show interface counters":
+			interfaceStats = ParseInterfaceCounters(output)
 		}
 	}
 
 	// Compute a hash of the raw output for change detection
 	hash := sha256Hash(rawData)
 
-	emit("parse", fmt.Sprintf("%d ports, %d topology entries", len(portStates), len(topology)), "done")
+	emit("parse", fmt.Sprintf("%d ports, %d topology, %d MACs, %d PoE, %d stats",
+		len(portStates), len(topology), len(macTable), len(poeStatus), len(interfaceStats)), "done")
 	emit("complete", fmt.Sprintf("%s: scan voltooid", sw.Name), "done")
 
 	return &api.NetworkIngestRequest{
-		SwitchID:     sw.ID,
-		SwitchName:   sw.Name,
-		DataHash:     hash,
-		Changed:      true, // TODO: compare against stored hash in fase C-gamma
-		RawData:      rawData,
-		Severity:     "info",
-		ScanType:     "full",
-		PortStates:   portStates,
-		Topology:     topology,
-		ScanProgress: nil, // progress is streamed separately via IngestScanProgress
+		SwitchID:       sw.ID,
+		SwitchName:     sw.Name,
+		DataHash:       hash,
+		Changed:        true,
+		RawData:        rawData,
+		Severity:       "info",
+		ScanType:       "full",
+		PortStates:     portStates,
+		Topology:       topology,
+		MACTable:       macTable,
+		PoEStatus:      poeStatus,
+		InterfaceStats: interfaceStats,
+		ScanProgress:   nil,
 	}, nil
 }
 

@@ -58,8 +58,11 @@ func ConfigureSyslog(host string, creds Credentials, model string, syslogHost st
 		loggingCmd = fmt.Sprintf("logging host %s port 1514 severity %s", syslogHost, sevKeyword)
 	}
 
+	// Remove legacy logging host 172.16.0.1 (oude VPS setup) voordat we de
+	// nieuwe zetten. Als die regel niet bestaat negeert de switch de 'no' regel.
 	commands := []string{
 		"configure",
+		"no logging host 172.16.0.1",
 		loggingCmd,
 		"end",
 		"write memory",
@@ -68,10 +71,11 @@ func ConfigureSyslog(host string, creds Credentials, model string, syslogHost st
 	var output strings.Builder
 	for _, cmd := range commands {
 		out, err := client.Run(cmd, 10*time.Second)
-		if err != nil {
+		output.WriteString(fmt.Sprintf("> %s\n%s\n", cmd, out))
+		// "no logging host" mag falen als die host niet bestaat — niet fataal
+		if err != nil && !strings.HasPrefix(cmd, "no ") {
 			return output.String(), fmt.Errorf("command %q failed: %w", cmd, err)
 		}
-		output.WriteString(fmt.Sprintf("> %s\n%s\n", cmd, out))
 	}
 
 	return output.String(), nil
@@ -272,6 +276,6 @@ func ExecuteConfigureAction(
 	}
 
 	logger.Info("configure action completed", "output_len", len(output))
-	emit("complete", fmt.Sprintf("%s geconfigureerd", sw.Name), "done")
+	emit("switch_done", fmt.Sprintf("%s geconfigureerd", sw.Name), "done")
 	return ConfigureResult{SwitchID: sid, SwitchName: sw.Name, Success: true, Output: output}
 }

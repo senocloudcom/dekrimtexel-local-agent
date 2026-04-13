@@ -117,7 +117,7 @@ func ParseSTPGlobal(output string) *api.STPGlobal {
 
 	g := &api.STPGlobal{}
 
-	if m := regexp.MustCompile(`(?i)mode\s+(STP|RSTP|MSTP|rapid-pvst)`).FindStringSubmatch(header); m != nil {
+	if m := regexp.MustCompile(`(?i)mode\s*:?\s*(STP|RSTP|MSTP|rapid-pvst)`).FindStringSubmatch(header); m != nil {
 		mode := strings.ToUpper(m[1])
 		if mode == "RAPID-PVST" {
 			mode = "RSTP"

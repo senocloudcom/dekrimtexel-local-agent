@@ -118,6 +118,10 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 	var macTable []api.MACEntry
 	var poeStatus []api.PoEPortStatus
 	var interfaceStats []api.InterfaceStat
+	var stpPorts []api.STPPortState
+	var stpGlobal *api.STPGlobal
+	var vlans []api.VLAN
+	var vlanAssignments []api.VLANPortAssignment
 
 	for _, cmd := range commands {
 		emit("run_command", fmt.Sprintf("> %s", cmd), "running")
@@ -143,6 +147,13 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 			poeStatus = ParsePoEStatus(output)
 		case "show interfaces counters", "show interface counters":
 			interfaceStats = ParseInterfaceCounters(output)
+		case "show spanning-tree detail":
+			stpPorts = ParseSTPDetail(output)
+			stpGlobal = ParseSTPGlobal(output)
+		case "show vlan":
+			vlans = ParseVLANTable(output)
+		case "show interfaces switchport", "show interface switchport":
+			vlanAssignments = ParseSwitchport(output)
 		}
 	}
 
@@ -172,8 +183,9 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 		})
 	}
 
-	emit("parse", fmt.Sprintf("%d ports, %d topology, %d MACs, %d PoE, %d stats, %d snapshots",
-		len(portStates), len(topology), len(macTable), len(poeStatus), len(interfaceStats), len(portSnapshots)), "done")
+	emit("parse", fmt.Sprintf("%d ports, %d topology, %d MACs, %d PoE, %d stats, %d snapshots, %d STP, %d VLANs, %d VLAN-assigns",
+		len(portStates), len(topology), len(macTable), len(poeStatus), len(interfaceStats), len(portSnapshots),
+		len(stpPorts), len(vlans), len(vlanAssignments)), "done")
 	emit("complete", fmt.Sprintf("%s: scan voltooid", sw.Name), "done")
 
 	return &api.NetworkIngestRequest{
@@ -189,8 +201,12 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 		MACTable:       macTable,
 		PoEStatus:      poeStatus,
 		InterfaceStats: interfaceStats,
-		PortSnapshots:  portSnapshots,
-		ScanProgress:   nil,
+		PortSnapshots:   portSnapshots,
+		ScanProgress:    nil,
+		STPPorts:        stpPorts,
+		STPGlobal:       stpGlobal,
+		VLANs:           vlans,
+		VLANAssignments: vlanAssignments,
 	}, nil
 }
 

@@ -176,6 +176,52 @@ type NetworkIngestRequest struct {
 	InterfaceStats  []InterfaceStat        `json:"interface_stats,omitempty"`
 	PortSnapshots   []PortDeviceSnapshot   `json:"port_snapshots,omitempty"`
 	ScanProgress    []ScanProgressStep     `json:"scan_progress,omitempty"`
+	STPPorts        []STPPortState         `json:"stp_ports,omitempty"`
+	STPGlobal       *STPGlobal             `json:"stp_global,omitempty"`
+	VLANs           []VLAN                 `json:"vlans,omitempty"`
+	VLANAssignments []VLANPortAssignment   `json:"vlan_assignments,omitempty"`
+}
+
+// STPPortState is one port row from `show spanning-tree detail`
+type STPPortState struct {
+	Port               string `json:"port"`
+	Enabled            bool   `json:"enabled"`
+	State              string `json:"state,omitempty"`
+	Role               string `json:"role,omitempty"`
+	Protocol           string `json:"protocol,omitempty"`
+	PortCost           int    `json:"port_cost,omitempty"`
+	EdgePort           bool   `json:"edge_port"`
+	EdgePortConfigured string `json:"edge_port_configured,omitempty"`
+	BPDUGuard          bool   `json:"bpdu_guard"`
+	RootGuard          bool   `json:"root_guard"`
+	Transitions        int    `json:"transitions,omitempty"`
+	BPDUSent           int64  `json:"bpdu_sent,omitempty"`
+	BPDUReceived       int64  `json:"bpdu_received,omitempty"`
+}
+
+// STPGlobal is the per-switch STP summary from `show spanning-tree detail`
+type STPGlobal struct {
+	Mode               string `json:"mode,omitempty"`
+	RootBridgePriority *int   `json:"root_bridge_priority,omitempty"`
+	RootBridgeAddress  string `json:"root_bridge_address,omitempty"`
+	TopologyChanges    *int   `json:"topology_changes,omitempty"`
+	LastTopologyChange string `json:"last_topology_change,omitempty"`
+}
+
+// VLAN is one VLAN definition from `show vlan`
+type VLAN struct {
+	VLANID int      `json:"vlan_id"`
+	Name   string   `json:"name,omitempty"`
+	Ports  []string `json:"ports"`
+}
+
+// VLANPortAssignment is one port's VLAN config from `show interfaces switchport`
+type VLANPortAssignment struct {
+	Port       string `json:"port"`
+	Mode       string `json:"mode,omitempty"` // access, trunk, general
+	AccessVLAN *int   `json:"access_vlan,omitempty"`
+	NativeVLAN *int   `json:"native_vlan,omitempty"`
+	TrunkVLANs string `json:"trunk_vlans,omitempty"`
 }
 
 // MACEntry is one row from `show mac address-table`

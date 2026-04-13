@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
+	"github.com/senocloudcom/dekrimtexel-local-agent/internal/ping"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/sonicwall"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/syslog"
@@ -48,6 +49,7 @@ type Scheduler struct {
 
 	syslogListener  *syslog.Listener
 	sonicwallPoller *sonicwall.Poller
+	pingPoller      *ping.Poller
 }
 
 // NewScheduler creates a new scheduler. Call Run to start it.
@@ -95,6 +97,17 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		go func() {
 			if err := s.syslogListener.Run(ctx); err != nil {
 				slog.Error("syslog listener failed", "err", err)
+			}
+		}()
+	}
+
+	// Start ping poller if targets configured
+	if s.config.Agent.Modules.Ping && len(s.config.PingTargets) > 0 {
+		s.pingPoller = ping.NewPoller(s.Client)
+		s.pingPoller.UpdateTargets(s.config.PingTargets)
+		go func() {
+			if err := s.pingPoller.Run(ctx); err != nil {
+				slog.Error("ping poller failed", "err", err)
 			}
 		}()
 	}
@@ -163,6 +176,10 @@ func (s *Scheduler) refetchConfig() error {
 	// Keep sonicwall poller in sync
 	if s.sonicwallPoller != nil {
 		_ = s.sonicwallPoller.UpdateDevices(cfg.SonicwallDevices)
+	}
+	// Keep ping poller in sync
+	if s.pingPoller != nil {
+		s.pingPoller.UpdateTargets(cfg.PingTargets)
 	}
 	return nil
 }

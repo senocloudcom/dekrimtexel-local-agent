@@ -176,6 +176,12 @@ func (c *Client) IngestSonicwall(payload map[string]interface{}) error {
 	return c.do("POST", "/v1/ingest/sonicwall", payload, &out)
 }
 
+// IngestPing sends a batch of ping/TCP check results.
+func (c *Client) IngestPing(results interface{}) error {
+	var out IngestResponse
+	return c.do("POST", "/v1/ingest/ping", map[string]interface{}{"results": results}, &out)
+}
+
 // IngestScanProgress sends just scan progress updates (wraps IngestNetwork with minimal fields).
 // Used for live progress updates during a scan so the dashboard modal can show steps in real time.
 func (c *Client) IngestScanProgress(switchID int, switchName string, steps []ScanProgressStep) error {

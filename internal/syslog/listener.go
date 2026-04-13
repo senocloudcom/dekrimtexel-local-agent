@@ -75,11 +75,13 @@ func (l *Listener) Run(ctx context.Context) error {
 		port = 1514
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", addr, port))
+	// Expliciet IPv4 — op Windows bindt "udp" met "0.0.0.0" soms aan IPv6 (::)
+	// wat switches die IPv4 syslog sturen niet ontvangt.
+	udpAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
 		return fmt.Errorf("resolve udp addr: %w", err)
 	}
-	conn, err := net.ListenUDP("udp", udpAddr)
+	conn, err := net.ListenUDP("udp4", udpAddr)
 	if err != nil {
 		return fmt.Errorf("listen udp: %w", err)
 	}

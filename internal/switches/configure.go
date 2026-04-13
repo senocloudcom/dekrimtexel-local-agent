@@ -19,35 +19,48 @@ type ConfigureResult struct {
 }
 
 // ConfigureSyslog connects to a switch and configures syslog forwarding.
-// CBS350 commands:
-//
-//	configure
-//	logging host <syslog_host> port 1514 severity <level>
-//	end
-//	write memory
-func ConfigureSyslog(host string, creds Credentials, syslogHost string, syslogLevel string, timeout time.Duration) (string, error) {
+// Supports both CBS350 (severity as keyword) and CBS220 (severity as number + facility).
+// Detects model from `show version` output.
+func ConfigureSyslog(host string, creds Credentials, model string, syslogHost string, syslogLevel string, timeout time.Duration) (string, error) {
 	client, err := Connect(host, creds.Username, creds.Password, timeout)
 	if err != nil {
 		return "", fmt.Errorf("ssh connect: %w", err)
 	}
 	defer client.Close()
 
-	// Map level string to CBS350 severity keyword
-	severityMap := map[string]string{
+	// Detect CBS220 vs CBS350 — different CLI dialects
+	modelLower := strings.ToLower(model)
+	isCBS220 := strings.Contains(modelLower, "cbs220")
+
+	// Normalize level
+	sevNum := syslogLevel
+	if sevNum == "" {
+		sevNum = "4" // warnings default
+	}
+	sevKeywordMap := map[string]string{
 		"3": "errors",
 		"4": "warnings",
 		"5": "notifications",
 		"6": "informational",
 		"7": "debugging",
 	}
-	severity := severityMap[syslogLevel]
-	if severity == "" {
-		severity = "warnings"
+	sevKeyword := sevKeywordMap[sevNum]
+	if sevKeyword == "" {
+		sevKeyword = "warnings"
+	}
+
+	var loggingCmd string
+	if isCBS220 {
+		// CBS220: severity as number, include facility
+		loggingCmd = fmt.Sprintf("logging host %s port 1514 severity %s facility local7", syslogHost, sevNum)
+	} else {
+		// CBS350: severity as keyword
+		loggingCmd = fmt.Sprintf("logging host %s port 1514 severity %s", syslogHost, sevKeyword)
 	}
 
 	commands := []string{
 		"configure",
-		fmt.Sprintf("logging host %s port 1514 severity %s", syslogHost, severity),
+		loggingCmd,
 		"end",
 		"write memory",
 	}
@@ -223,7 +236,7 @@ func ExecuteConfigureAction(
 			syslogLevel = "4"
 		}
 		emit("configure_syslog", fmt.Sprintf("Syslog configureren op %s → %s (level %s)", sw.Name, syslogHost, syslogLevel), "running")
-		output, err = ConfigureSyslog(sw.Host, creds, syslogHost, syslogLevel, 30*time.Second)
+		output, err = ConfigureSyslog(sw.Host, creds, sw.Model, syslogHost, syslogLevel, 30*time.Second)
 
 	case "disable_pnp":
 		emit("disable_pnp", fmt.Sprintf("PNP uitschakelen op %s", sw.Name), "running")

@@ -42,6 +42,8 @@ type Scheduler struct {
 	locker             SwitchLocker
 	scanSem            chan struct{}
 	periodicInProgress atomic.Bool
+	periodicStartedAt  atomic.Value // time.Time
+	lastPeriodicAt     atomic.Value // time.Time
 	activeScans        sync.Map // dedupe voor legacy triggers
 
 	syslogListener  *syslog.Listener
@@ -166,7 +168,27 @@ func (s *Scheduler) refetchConfig() error {
 }
 
 func (s *Scheduler) sendHeartbeat() {
-	if err := s.Client.Heartbeat(s.Hostname, s.AgentType, s.Version); err != nil {
+	req := api.HeartbeatRequest{
+		Hostname:  s.Hostname,
+		AgentType: s.AgentType,
+		Version:   s.Version,
+	}
+	if last := s.lastPeriodicAt.Load(); last != nil {
+		if t, ok := last.(time.Time); ok && !t.IsZero() {
+			req.LastPeriodicScanAt = t.UTC().Format(time.RFC3339)
+		}
+	}
+	if started := s.periodicStartedAt.Load(); started != nil {
+		if t, ok := started.(time.Time); ok && !t.IsZero() {
+			req.PeriodicScanRunningSince = t.UTC().Format(time.RFC3339)
+		}
+	}
+	if s.syslogListener != nil {
+		req.SyslogListenerActive = true
+		req.SyslogEventsReceived = s.syslogListener.EventsReceived()
+	}
+
+	if err := s.Client.HeartbeatWithHealth(req); err != nil {
 		slog.Error("heartbeat failed", "err", err)
 		return
 	}
@@ -178,15 +200,51 @@ func (s *Scheduler) sendHeartbeat() {
 // niet de scan_jobs queue. Dat is bewust — periodic runs hoeven niet in de
 // admin scan-jobs lijst te verschijnen totdat we daar reden voor hebben.
 func (s *Scheduler) runPeriodicScan() {
+	// Detect hung previous scan: reset if it's been running > 15 min
+	if started := s.periodicStartedAt.Load(); started != nil {
+		if startTime, ok := started.(time.Time); ok {
+			if time.Since(startTime) > 15*time.Minute {
+				slog.Warn("previous periodic scan appears hung, force-resetting",
+					"started_at", startTime, "duration", time.Since(startTime))
+				s.periodicInProgress.Store(false)
+			}
+		}
+	}
+
 	if !s.periodicInProgress.CompareAndSwap(false, true) {
 		slog.Info("periodic scan skipped: previous run still in progress")
 		return
 	}
-	defer s.periodicInProgress.Store(false)
+	now := time.Now()
+	s.periodicStartedAt.Store(now)
+	defer func() {
+		s.periodicInProgress.Store(false)
+		s.periodicStartedAt.Store(time.Time{})
+		s.lastPeriodicAt.Store(time.Now())
+	}()
 
 	scanID := "periodic-" + uuid.NewString()
 	slog.Info("periodic scan starting", "scan_id", scanID)
-	s.executeScan(scanID, nil)
+
+	// Run scan in goroutine with 10 min timeout
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("periodic scan panic", "recover", r)
+			}
+		}()
+		s.executeScan(scanID, nil)
+	}()
+
+	select {
+	case <-done:
+		slog.Info("periodic scan finished", "scan_id", scanID, "duration", time.Since(now))
+	case <-time.After(10 * time.Minute):
+		slog.Error("periodic scan timeout (10 min), continuing", "scan_id", scanID)
+		// Don't block — scan goroutine will finish eventually or be abandoned
+	}
 }
 
 // scanResult is what executeScan returns to the caller (either pollJobs or

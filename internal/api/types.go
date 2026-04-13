@@ -20,9 +20,13 @@ type PairResponse struct {
 
 // HeartbeatRequest is sent to POST /v1/ingest/heartbeat
 type HeartbeatRequest struct {
-	Hostname  string `json:"hostname"`
-	AgentType string `json:"agent_type"`
-	Version   string `json:"version"`
+	Hostname                  string    `json:"hostname"`
+	AgentType                 string    `json:"agent_type"`
+	Version                   string    `json:"version"`
+	LastPeriodicScanAt        string    `json:"last_periodic_scan_at,omitempty"`
+	PeriodicScanRunningSince  string    `json:"periodic_scan_running_since,omitempty"`
+	SyslogListenerActive      bool      `json:"syslog_listener_active,omitempty"`
+	SyslogEventsReceived      int64     `json:"syslog_events_received,omitempty"`
 }
 
 // RemoteConfig is returned by GET /v1/agent/config

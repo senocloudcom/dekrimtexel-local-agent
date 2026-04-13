@@ -29,8 +29,14 @@ type Listener struct {
 	buffer    []api.SyslogEvent
 	switchMap map[string]int // source IP → switch_id
 
-	dropped atomic.Uint64
-	flushCh chan struct{}
+	dropped  atomic.Uint64
+	received atomic.Int64
+	flushCh  chan struct{}
+}
+
+// EventsReceived returns total syslog events processed since start.
+func (l *Listener) EventsReceived() int64 {
+	return l.received.Load()
 }
 
 // NewListener creates a listener. Call Run to start it.
@@ -121,6 +127,7 @@ func (l *Listener) handleMessage(raw, sourceIP string) {
 		}
 	}()
 
+	l.received.Add(1)
 	parsed := ParseMessage(raw)
 	ev := api.SyslogEvent{
 		SourceIP:      sourceIP,

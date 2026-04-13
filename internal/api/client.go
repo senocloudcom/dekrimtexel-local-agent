@@ -103,6 +103,11 @@ func (c *Client) Heartbeat(hostname, agentType, version string) error {
 	}, nil)
 }
 
+// HeartbeatWithHealth sends heartbeat with extra health fields.
+func (c *Client) HeartbeatWithHealth(req HeartbeatRequest) error {
+	return c.do("POST", "/v1/ingest/heartbeat", req, nil)
+}
+
 // GetConfig fetches the remote runtime config for this agent.
 func (c *Client) GetConfig() (*RemoteConfig, error) {
 	var out RemoteConfig

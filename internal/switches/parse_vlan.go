@@ -9,9 +9,11 @@ import (
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
 )
 
-// ParseVLANTable parses `show vlan` output (CBS350/CBS220) into a list of
-// VLANs with their member ports. Supports the compact range notation
-// (gi1/0/1-24, te1/0/1-4, Po1-8) that CBS/Sx-series use.
+// ParseVLANTable parses `show vlan` output for CBS350 (simple layout) and
+// CBS220/C1300 (Tagged Ports + Untagged Ports + Created by columns). The
+// CBS220 format is detected from the header line and parsed column-based
+// using the `----` separator widths; otherwise a whitespace-based split
+// is used.
 func ParseVLANTable(output string) []api.VLAN {
 	if strings.TrimSpace(output) == "" {
 		return nil
@@ -19,8 +21,26 @@ func ParseVLANTable(output string) []api.VLAN {
 
 	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
 
-	// Find the first line of data by scanning for the header separator (---)
-	// or a "VLAN   Name" header.
+	// Detect CBS220 layout: header mentions both "Tagged Ports" and
+	// "UnTagged Ports" (spelling varies), with a `----` separator that
+	// defines column widths.
+	headerIdx, sepIdx := -1, -1
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		if headerIdx < 0 && strings.Contains(lower, "vlan") &&
+			strings.Contains(lower, "tagged") && strings.Contains(lower, "untagged") {
+			headerIdx = i
+		}
+		if headerIdx >= 0 && i > headerIdx && regexp.MustCompile(`^\s*-{3,}`).MatchString(line) {
+			sepIdx = i
+			break
+		}
+	}
+	if headerIdx >= 0 && sepIdx > headerIdx {
+		return parseVLANTableCBS220(lines, sepIdx)
+	}
+
+	// Fallback: CBS350-style whitespace parsing.
 	reSep := regexp.MustCompile(`^\s*-{3,}`)
 	reHeader := regexp.MustCompile(`(?i)^\s*VLAN\s+Name\s+`)
 	dataStart := 0
@@ -53,7 +73,6 @@ func ParseVLANTable(output string) []api.VLAN {
 				Ports:  extractPorts(strings.TrimSpace(m[3])),
 			}
 		} else if cur != nil {
-			// continuation line — extra ports for the previous VLAN
 			cur.Ports = append(cur.Ports, extractPorts(strings.TrimSpace(line))...)
 		}
 	}
@@ -63,11 +82,75 @@ func ParseVLANTable(output string) []api.VLAN {
 	return vlans
 }
 
+// parseVLANTableCBS220 parses VLAN output using column positions determined
+// from the `----` separator line (lines[sepIdx]). Columns are:
+//
+//	Vlan | Name | Tagged Ports | UnTagged Ports | Created by
+func parseVLANTableCBS220(lines []string, sepIdx int) []api.VLAN {
+	sep := lines[sepIdx]
+	// Find column spans: groups of '-' separated by whitespace
+	var spans [][2]int // [start, end) per column
+	i := 0
+	for i < len(sep) {
+		if sep[i] == '-' {
+			start := i
+			for i < len(sep) && sep[i] == '-' {
+				i++
+			}
+			spans = append(spans, [2]int{start, i})
+			continue
+		}
+		i++
+	}
+	if len(spans) < 4 {
+		// Unexpected layout — bail to empty rather than garbage
+		return nil
+	}
+
+	slice := func(line string, col [2]int) string {
+		if col[0] >= len(line) {
+			return ""
+		}
+		end := col[1]
+		if end > len(line) {
+			end = len(line)
+		}
+		return strings.TrimSpace(line[col[0]:end])
+	}
+
+	var vlans []api.VLAN
+	for _, line := range lines[sepIdx+1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		vlanStr := slice(line, spans[0])
+		id, err := strconv.Atoi(vlanStr)
+		if err != nil {
+			continue
+		}
+		name := slice(line, spans[1])
+		tagged := slice(line, spans[2])
+		untagged := slice(line, spans[3])
+
+		var ports []string
+		ports = append(ports, extractPorts(tagged)...)
+		ports = append(ports, extractPorts(untagged)...)
+
+		vlans = append(vlans, api.VLAN{
+			VLANID: id,
+			Name:   name,
+			Ports:  ports,
+		})
+	}
+	return vlans
+}
+
 var (
-	reLongRange  = regexp.MustCompile(`(?i)^(gi|te|fa)((\d+/\d+/)(\d+))-(?:gi|te|fa)\d+/\d+/(\d+)$`)
-	reShortRange = regexp.MustCompile(`(?i)^(gi|te|fa)((\d+/\d+/)(\d+))-(\d+)$`)
-	rePoRange    = regexp.MustCompile(`(?i)^(Po)(\d+)-(\d+)$`)
-	rePortName   = regexp.MustCompile(`(?i)^(gi|te|fa|po)\d`)
+	reLongRange   = regexp.MustCompile(`(?i)^(gi|te|fa)((\d+/\d+/)(\d+))-(?:gi|te|fa)\d+/\d+/(\d+)$`)
+	reShortRange  = regexp.MustCompile(`(?i)^(gi|te|fa)((\d+/\d+/)(\d+))-(\d+)$`)
+	reCBS220Range = regexp.MustCompile(`(?i)^(gi|te|fa)(\d+)-(\d+)$`) // gi9-10 style (CBS220, no stack/slot)
+	rePoRange     = regexp.MustCompile(`(?i)^(Po)(\d+)-(\d+)$`)
+	rePortName    = regexp.MustCompile(`(?i)^(gi|te|fa|po)\d`)
 )
 
 func extractPorts(text string) []string {
@@ -97,6 +180,15 @@ func extractPorts(text string) []string {
 			slot := m[3]
 			for i := start; i <= end; i++ {
 				ports = append(ports, fmt.Sprintf("%s%s%d", prefix, slot, i))
+			}
+			continue
+		}
+		if m := reCBS220Range.FindStringSubmatch(part); m != nil {
+			start, _ := strconv.Atoi(m[2])
+			end, _ := strconv.Atoi(m[3])
+			prefix := strings.ToLower(m[1])
+			for i := start; i <= end; i++ {
+				ports = append(ports, fmt.Sprintf("%s%d", prefix, i))
 			}
 			continue
 		}

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
@@ -26,10 +27,24 @@ type Poller struct {
 }
 
 type deviceState struct {
-	cfg         api.SonicwallDevice
-	username    string
-	password    string
-	httpClient  *http.Client
+	cfg          api.SonicwallDevice
+	username     string
+	password     string
+	httpClient   *http.Client
+	sessionMu    sync.Mutex
+	loggedIn     bool
+	leaseCache   map[string]cachedLease // key = ip_address
+	cacheMu      sync.Mutex
+}
+
+// cachedLease is the previous state for diff detection
+type cachedLease struct {
+	MAC           string
+	HostName      string
+	Vendor        string
+	LeaseType     string
+	LeaseExpires  string
+	IssuedAt      time.Time
 }
 
 // NewPoller creates a new SonicWall poller.
@@ -55,6 +70,7 @@ func (p *Poller) UpdateDevices(devices []api.SonicwallDevice) error {
 			username:   creds.Username,
 			password:   creds.Password,
 			httpClient: &http.Client{Transport: transport, Timeout: 30 * time.Second, Jar: jar},
+			leaseCache: make(map[string]cachedLease),
 		})
 	}
 	p.devices = newStates
@@ -62,31 +78,33 @@ func (p *Poller) UpdateDevices(devices []api.SonicwallDevice) error {
 	return nil
 }
 
-// Run starts polling each device on its interval.
+// Run starts polling each device with 2 tiers: fast (5s, DHCP only) + slow (PollInterval, everything).
 func (p *Poller) Run(ctx context.Context) error {
 	slog.Info("sonicwall poller started")
 
-	// Poll all devices immediately, then on their own interval
 	for i := range p.devices {
-		go p.pollLoop(ctx, &p.devices[i])
+		go p.slowLoop(ctx, &p.devices[i])
+		go p.fastLoop(ctx, &p.devices[i])
+		go p.keepAliveLoop(ctx, &p.devices[i])
 	}
 
 	<-ctx.Done()
+	// Logout all devices
+	for i := range p.devices {
+		p.devices[i].logoutIfAny()
+	}
 	return nil
 }
 
-func (p *Poller) pollLoop(ctx context.Context, d *deviceState) {
+// slowLoop runs the full poll (system/cpu/vpn/etc) on PollInterval (default 300s).
+func (p *Poller) slowLoop(ctx context.Context, d *deviceState) {
 	interval := time.Duration(d.cfg.PollInterval) * time.Second
 	if interval < 60*time.Second {
 		interval = 300 * time.Second
 	}
-
-	// Poll once immediately
 	p.pollDevice(d)
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -97,19 +115,189 @@ func (p *Poller) pollLoop(ctx context.Context, d *deviceState) {
 	}
 }
 
+// fastLoop runs only the DHCP lease poll every 5 seconds for near-realtime events.
+func (p *Poller) fastLoop(ctx context.Context, d *deviceState) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.pollDHCPFast(d)
+		}
+	}
+}
+
+// keepAliveLoop pings /version every 45 sec to keep the session alive (SonicOS inactivity = 60s).
+func (p *Poller) keepAliveLoop(ctx context.Context, d *deviceState) {
+	ticker := time.NewTicker(45 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.sessionMu.Lock()
+			if d.loggedIn {
+				_ = d.get("/version") // keeps session alive
+			}
+			d.sessionMu.Unlock()
+		}
+	}
+}
+
+// ensureSession zorgt dat er een geldige sessie is. Returned true bij success.
+func (d *deviceState) ensureSession() bool {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	if d.loggedIn {
+		// Quick health check
+		if res := d.get("/version"); res != nil {
+			return true
+		}
+		d.loggedIn = false
+	}
+	if err := d.login(); err != nil {
+		return false
+	}
+	_ = d.startManagement()
+	d.loggedIn = true
+	return true
+}
+
+func (d *deviceState) logoutIfAny() {
+	d.sessionMu.Lock()
+	defer d.sessionMu.Unlock()
+	if d.loggedIn {
+		d.logout()
+		d.loggedIn = false
+	}
+}
+
+// pollDHCPFast haalt alleen DHCP leases op en genereert events bij diffs.
+func (p *Poller) pollDHCPFast(d *deviceState) {
+	if !d.ensureSession() {
+		return
+	}
+
+	leases := d.getArray("/reporting/dhcp-server/ipv4/leases/status")
+	if leases == nil {
+		return
+	}
+
+	now := time.Now()
+	events := []map[string]interface{}{}
+	seenIPs := make(map[string]bool)
+	leaseList := []map[string]interface{}{}
+
+	d.cacheMu.Lock()
+	for _, lease := range leases {
+		ip := getString(lease, "ip_address")
+		if ip == "" {
+			continue
+		}
+		seenIPs[ip] = true
+		mac := getString(lease, "mac_address")
+		host := getString(lease, "host_name")
+		vendor := getString(lease, "vendor")
+		ltype := getString(lease, "type")
+		expires := getString(lease, "lease_expires")
+
+		prev, existed := d.leaseCache[ip]
+		var eventType string
+		issuedAt := now
+
+		switch {
+		case !existed:
+			eventType = "new"
+		case prev.MAC != mac:
+			// IP now belongs to different MAC — treat as new
+			eventType = "new"
+		case prev.LeaseExpires != expires:
+			eventType = "renewal"
+			issuedAt = prev.IssuedAt // keep original issue time
+		default:
+			// Nothing changed — just update cache
+			issuedAt = prev.IssuedAt
+		}
+
+		if eventType != "" {
+			events = append(events, map[string]interface{}{
+				"event_type":    eventType,
+				"ip_address":    ip,
+				"mac_address":   mac,
+				"host_name":     host,
+				"vendor":        vendor,
+				"lease_type":    ltype,
+				"lease_expires": expires,
+			})
+		}
+
+		d.leaseCache[ip] = cachedLease{
+			MAC:          mac,
+			HostName:     host,
+			Vendor:       vendor,
+			LeaseType:    ltype,
+			LeaseExpires: expires,
+			IssuedAt:     issuedAt,
+		}
+
+		leaseList = append(leaseList, map[string]interface{}{
+			"ip_address":    ip,
+			"mac_address":   mac,
+			"host_name":     host,
+			"vendor":        vendor,
+			"lease_expires": expires,
+			"type":          ltype,
+			"issued_at":     issuedAt.Format(time.RFC3339),
+		})
+	}
+
+	// Detect releases (leases no longer in response)
+	for ip, prev := range d.leaseCache {
+		if !seenIPs[ip] {
+			events = append(events, map[string]interface{}{
+				"event_type":    "release",
+				"ip_address":    ip,
+				"mac_address":   prev.MAC,
+				"host_name":     prev.HostName,
+				"vendor":        prev.Vendor,
+				"lease_type":    prev.LeaseType,
+				"lease_expires": prev.LeaseExpires,
+			})
+			delete(d.leaseCache, ip)
+		}
+	}
+	d.cacheMu.Unlock()
+
+	if len(events) == 0 {
+		return
+	}
+
+	// Push only the events + fresh leases, not the heavy metrics
+	payload := map[string]interface{}{
+		"host":        d.cfg.Host,
+		"name":        d.cfg.Name,
+		"dhcp_leases": leaseList,
+		"dhcp_events": events,
+		"fast_poll":   true,
+	}
+	if err := p.Client.IngestSonicwall(payload); err != nil {
+		slog.Warn("fast poll ingest failed", "host", d.cfg.Host, "err", err)
+	} else {
+		slog.Info("fast poll", "host", d.cfg.Host, "events", len(events), "leases", len(leaseList))
+	}
+}
+
 func (p *Poller) pollDevice(d *deviceState) {
 	logger := slog.With("sonicwall", d.cfg.Name, "host", d.cfg.Host)
 
-	// Authenticate: login + start-management (required on SonicOS 7.x)
-	if err := d.login(); err != nil {
-		logger.Error("login failed", "err", err)
+	if !d.ensureSession() {
+		logger.Error("cannot establish session")
 		return
 	}
-	if err := d.startManagement(); err != nil {
-		logger.Warn("start-management failed (maybe already in mgmt)", "err", err)
-	}
-	// Always try to logout at the end to free the session slot
-	defer d.logout()
+	// Session blijft open — fastLoop en keepAliveLoop gebruiken hem ook
 
 	var deviceInfo map[string]interface{}
 	vpnTunnels := []map[string]interface{}{}
@@ -221,17 +409,19 @@ func (p *Poller) pollDevice(d *deviceState) {
 		}
 	}
 
-	// DHCP leases (array response, niet object)
-	dhcpLeases := []map[string]interface{}{}
-	for _, lease := range d.getArray("/reporting/dhcp-server/ipv4/leases/status") {
-		dhcpLeases = append(dhcpLeases, map[string]interface{}{
-			"ip_address":    getString(lease, "ip_address"),
-			"mac_address":   getString(lease, "mac_address"),
-			"host_name":     getString(lease, "host_name"),
-			"vendor":        getString(lease, "vendor"),
-			"lease_expires": getString(lease, "lease_expires"),
-			"type":          getString(lease, "type"),
-		})
+	// DHCP leases worden door fastLoop gedaan, hier niet
+
+	// DHCP scopes (elke 5 min genoeg — slow poll)
+	dhcpScopes := []map[string]interface{}{}
+	if res := d.get("/dhcp-server/ipv4/scopes/dynamic"); res != nil {
+		for _, s := range extractScopes(res, "dynamic") {
+			dhcpScopes = append(dhcpScopes, s)
+		}
+	}
+	if res := d.get("/dhcp-server/ipv4/scopes/static"); res != nil {
+		for _, s := range extractScopes(res, "static") {
+			dhcpScopes = append(dhcpScopes, s)
+		}
 	}
 
 	// HA status
@@ -256,7 +446,7 @@ func (p *Poller) pollDevice(d *deviceState) {
 		"top_threats": topThreats,
 		"ha_info":     haInfo,
 		"metrics":     metrics,
-		"dhcp_leases": dhcpLeases,
+		"dhcp_scopes": dhcpScopes,
 	}
 
 	if err := p.Client.IngestSonicwall(payload); err != nil {
@@ -374,6 +564,43 @@ func (d *deviceState) getArray(path string) []map[string]interface{} {
 		return nil
 	}
 	return arr
+}
+
+// extractScopes parses /dhcp-server/ipv4/scopes/{dynamic,static} response
+func extractScopes(res map[string]interface{}, scopeType string) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	// Path: dhcp_server.ipv4.scope.{dynamic|static} = array
+	server, _ := res["dhcp_server"].(map[string]interface{})
+	if server == nil {
+		return out
+	}
+	ipv4, _ := server["ipv4"].(map[string]interface{})
+	if ipv4 == nil {
+		return out
+	}
+	scope, _ := ipv4["scope"].(map[string]interface{})
+	if scope == nil {
+		return out
+	}
+	arr, _ := scope[scopeType].([]interface{})
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"scope_from":      getString(m, "from"),
+			"scope_to":        getString(m, "to"),
+			"netmask":         getString(m, "netmask"),
+			"default_gateway": getString(m, "default_gateway"),
+			"domain_name":     getString(m, "domain_name"),
+			"lease_time":      m["lease_time"],
+			"scope_type":      scopeType,
+			"label":           getString(m, "comment"),
+			"enabled":         getBool(m, "enable"),
+		})
+	}
+	return out
 }
 
 func isSuccess(data map[string]interface{}) bool {

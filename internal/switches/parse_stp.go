@@ -18,7 +18,7 @@ func ParseSTPDetail(output string) []api.STPPortState {
 
 	// Split into per-port blocks. A block starts with "Port gi1/0/X enabled/disabled".
 	// We prepend a newline so the first block is also caught by the lookahead split.
-	reSplit := regexp.MustCompile(`(?im)\nPort\s+(?:gi|te|fa)\d+/\d+/\d+\s+`)
+	reSplit := regexp.MustCompile(`(?im)\nPort\s+(?:gi|te|fa)\d+(?:/\d+/\d+)?\s+`)
 	// Go's regexp has no lookahead, so we split on the pattern and then re-attach
 	// each header by using FindAllStringIndex.
 	indices := reSplit.FindAllStringIndex("\n"+output, -1)
@@ -39,7 +39,7 @@ func ParseSTPDetail(output string) []api.STPPortState {
 		blocks = append(blocks, padded[start:end])
 	}
 
-	rePortHeader := regexp.MustCompile(`(?i)Port\s+((?:gi|te|fa)\d+/\d+/\d+)\s+(enabled|disabled)`)
+	rePortHeader := regexp.MustCompile(`(?i)Port\s+((?:gi|te|fa)\d+(?:/\d+/\d+)?)\s+(enabled|disabled)`)
 	reStateRole := regexp.MustCompile(`(?is)State:\s*(\S+).*?Role:\s*(\S+)`)
 	rePortCost := regexp.MustCompile(`Port cost:\s*(\d+)`)
 	reType := regexp.MustCompile(`Type:\s*\S+\s*\(configured:\S+\s*\)\s*(\S+)`)

@@ -208,15 +208,23 @@ func extractPorts(text string) []string {
 }
 
 // ParseSwitchport parses `show interfaces switchport` for CBS350/CBS220.
-// Supports the "Information of <port>" block format (CBS350) as primary
-// strategy, falling back to a simpler block split if that yields nothing.
+// CBS220 uses "Name: gi1" as per-port block marker while CBS350 uses
+// "Information of gi1/0/1". SSH paging artifacts (ANSI escape codes,
+// "More:" prompts) are stripped before splitting.
 func ParseSwitchport(output string) []api.VLANPortAssignment {
 	if strings.TrimSpace(output) == "" {
 		return nil
 	}
 
-	// Split on "Information of <port>" or a bare port header at line-start.
-	reBlockStart := regexp.MustCompile(`(?mi)^(?:Information\s+of\s+)?((?:gi|te|fa|po)\d\S*)\s*:?\s*$|(?i)Port\s*:\s*((?:gi|te|fa|po)\d\S*)`)
+	// Strip ANSI escape sequences and SSH pager artifacts that otherwise
+	// split blocks in weird places.
+	reANSI := regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+	output = reANSI.ReplaceAllString(output, "")
+	output = regexp.MustCompile(`More:\s*<space>[^\r\n]*`).ReplaceAllString(output, "")
+
+	// Find per-port block boundaries. A block starts at a "Name: <port>"
+	// (CBS220), "Information of <port>" (CBS350) or "Port: <port>".
+	reBlockStart := regexp.MustCompile(`(?mi)^\s*(?:Name|Information\s+of|Port)\s*:?\s*((?:gi|te|fa|po)\d\S*)`)
 	matches := reBlockStart.FindAllStringIndex(output, -1)
 	if len(matches) == 0 {
 		return nil
@@ -233,7 +241,7 @@ func ParseSwitchport(output string) []api.VLANPortAssignment {
 		blocks = append(blocks, output[idx[0]:end])
 	}
 
-	rePortName2 := regexp.MustCompile(`(?i)((?:gi|te|fa|po)\d\S*)`)
+	rePortName2 := regexp.MustCompile(`(?i)(?:Name|Information\s+of|Port)\s*:?\s*((?:gi|te|fa|po)\d\S*)`)
 	reMode1 := regexp.MustCompile(`(?i)(?:VLAN\s+Membership\s+Mode|Port\s+Mode|Administrative\s+Mode|Operational\s+Mode)\s*:\s*(\S+)`)
 	reMode2 := regexp.MustCompile(`(?i)Mode\s*:\s*(Access|Trunk|General|Hybrid)`)
 	reAccess := regexp.MustCompile(`(?i)Access\s+(?:Mode\s+)?VLAN\s*:\s*(\d+)`)

@@ -145,6 +145,16 @@ func Connect(host, username, password string, timeout time.Duration) (*SSHClient
 		return nil, fmt.Errorf("wait for # prompt (login may have failed): %w", err)
 	}
 
+	// Disable paging for the remainder of the session. CBS220/CBS350 accept
+	// "terminal datadump" (disables --More-- prompt). Ignore errors — on
+	// unsupported firmware the command fails silently and paging stays on
+	// (Run() handles --More-- as fallback). Also widen the terminal length
+	// as a belt-and-suspenders measure.
+	_, _ = c.stdin.Write([]byte("terminal datadump\n"))
+	_ = c.readUntil("#", 5*time.Second)
+	_, _ = c.stdin.Write([]byte("terminal length 0\n"))
+	_ = c.readUntil("#", 5*time.Second)
+
 	return c, nil
 }
 

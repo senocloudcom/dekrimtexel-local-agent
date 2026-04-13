@@ -32,21 +32,32 @@ func ConfigureSyslog(host string, creds Credentials, model string, syslogHost st
 	modelLower := strings.ToLower(model)
 	isCBS220 := strings.Contains(modelLower, "cbs220")
 
-	// Normalize level
-	sevNum := syslogLevel
-	if sevNum == "" {
-		sevNum = "4" // warnings default
+	// Normalize level — input kan keyword OF nummer zijn
+	numToKeyword := map[string]string{
+		"0": "emergencies", "1": "alerts", "2": "critical",
+		"3": "errors", "4": "warnings", "5": "notifications",
+		"6": "informational", "7": "debugging",
 	}
-	sevKeywordMap := map[string]string{
-		"3": "errors",
-		"4": "warnings",
-		"5": "notifications",
-		"6": "informational",
-		"7": "debugging",
+	keywordToNum := map[string]string{
+		"emergencies": "0", "alerts": "1", "critical": "2",
+		"errors": "3", "warnings": "4", "notifications": "5",
+		"informational": "6", "debugging": "7",
 	}
-	sevKeyword := sevKeywordMap[sevNum]
-	if sevKeyword == "" {
+
+	input := strings.ToLower(strings.TrimSpace(syslogLevel))
+	var sevNum, sevKeyword string
+	if k, ok := numToKeyword[input]; ok {
+		// input was nummer
+		sevNum = input
+		sevKeyword = k
+	} else if n, ok := keywordToNum[input]; ok {
+		// input was keyword
+		sevKeyword = input
+		sevNum = n
+	} else {
+		// fallback
 		sevKeyword = "warnings"
+		sevNum = "4"
 	}
 
 	var loggingCmd string

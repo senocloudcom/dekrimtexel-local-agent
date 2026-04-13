@@ -571,7 +571,12 @@ func (s *Scheduler) scanOneSwitch(sw api.SwitchConfig, scanID string) error {
 		}()
 	}
 
-	result, err := switches.ScanSwitch(sw, creds, scanID, progress)
+	var macLookup switches.MACLookup
+	if s.sonicwallPoller != nil {
+		macLookup = s.sonicwallPoller.LookupMAC
+	}
+
+	result, err := switches.ScanSwitch(sw, creds, scanID, progress, macLookup)
 	if err != nil {
 		return err
 	}

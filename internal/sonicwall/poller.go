@@ -52,6 +52,27 @@ func NewPoller(client *api.Client, secretKey string) *Poller {
 	return &Poller{Client: client, SecretKey: secretKey}
 }
 
+// LookupMAC zoekt een MAC in de DHCP lease cache van alle devices.
+// Returnt IP, hostname, vendor (lege strings als niet gevonden).
+func (p *Poller) LookupMAC(mac string) (ip, hostname, vendor string) {
+	mac = strings.ToLower(strings.TrimSpace(mac))
+	if mac == "" {
+		return "", "", ""
+	}
+	for i := range p.devices {
+		d := &p.devices[i]
+		d.cacheMu.Lock()
+		for ip2, lease := range d.leaseCache {
+			if strings.ToLower(lease.MAC) == mac {
+				d.cacheMu.Unlock()
+				return ip2, lease.HostName, lease.Vendor
+			}
+		}
+		d.cacheMu.Unlock()
+	}
+	return "", "", ""
+}
+
 // UpdateDevices replaces the device list (called on config refetch).
 func (p *Poller) UpdateDevices(devices []api.SonicwallDevice) error {
 	newStates := make([]deviceState, 0, len(devices))

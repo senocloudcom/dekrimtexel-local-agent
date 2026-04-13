@@ -41,7 +41,10 @@ func DecryptCredentials(keyHex string, enc api.SSHCredentialsEncrypted) (Credent
 //
 // This is fase C-beta: only ports + LLDP + raw output. STP/VLAN/MAC parsing
 // comes in fase C-gamma.
-func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress func(api.ScanProgressStep)) (*api.NetworkIngestRequest, error) {
+// MACLookup resolves a MAC address to IP/hostname/vendor via external source (e.g. SonicWall DHCP)
+type MACLookup func(mac string) (ip, hostname, vendor string)
+
+func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress func(api.ScanProgressStep), macLookup MACLookup) (*api.NetworkIngestRequest, error) {
 	logger := slog.With("switch", sw.Name, "host", sw.Host, "scan_id", scanID)
 	logger.Info("scan start")
 
@@ -142,8 +145,31 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 	// Compute a hash of the raw output for change detection
 	hash := sha256Hash(rawData)
 
-	emit("parse", fmt.Sprintf("%d ports, %d topology, %d MACs, %d PoE, %d stats",
-		len(portStates), len(topology), len(macTable), len(poeStatus), len(interfaceStats)), "done")
+	// Build port_device_snapshots by correlating MAC table entries with DHCP lease cache
+	portSnapshots := []api.PortDeviceSnapshot{}
+	for _, m := range macTable {
+		if m.Port == "" || m.MACAddress == "" {
+			continue
+		}
+		// Skip CPU/management entries
+		if strings.EqualFold(m.Port, "CPU") || strings.EqualFold(m.Type, "management") {
+			continue
+		}
+		var ip, host, vendor string
+		if macLookup != nil {
+			ip, host, vendor = macLookup(m.MACAddress)
+		}
+		portSnapshots = append(portSnapshots, api.PortDeviceSnapshot{
+			Port:       m.Port,
+			MACAddress: strings.ToLower(m.MACAddress),
+			IPAddress:  ip,
+			Hostname:   host,
+			Vendor:     vendor,
+		})
+	}
+
+	emit("parse", fmt.Sprintf("%d ports, %d topology, %d MACs, %d PoE, %d stats, %d snapshots",
+		len(portStates), len(topology), len(macTable), len(poeStatus), len(interfaceStats), len(portSnapshots)), "done")
 	emit("complete", fmt.Sprintf("%s: scan voltooid", sw.Name), "done")
 
 	return &api.NetworkIngestRequest{
@@ -159,6 +185,7 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 		MACTable:       macTable,
 		PoEStatus:      poeStatus,
 		InterfaceStats: interfaceStats,
+		PortSnapshots:  portSnapshots,
 		ScanProgress:   nil,
 	}, nil
 }

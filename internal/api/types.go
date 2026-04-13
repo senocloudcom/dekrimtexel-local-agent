@@ -170,6 +170,7 @@ type NetworkIngestRequest struct {
 	MACTable        []MACEntry             `json:"mac_table,omitempty"`
 	PoEStatus       []PoEPortStatus        `json:"poe_status,omitempty"`
 	InterfaceStats  []InterfaceStat        `json:"interface_stats,omitempty"`
+	PortSnapshots   []PortDeviceSnapshot   `json:"port_snapshots,omitempty"`
 	ScanProgress    []ScanProgressStep     `json:"scan_progress,omitempty"`
 }
 
@@ -219,6 +220,15 @@ type TopologyEntry struct {
 	LinkSpeed    string `json:"link_speed,omitempty"`
 	Capabilities string `json:"capabilities,omitempty"`
 	DeviceID     string `json:"device_id,omitempty"`
+}
+
+// PortDeviceSnapshot is one MAC+IP paired observation on a switch port
+type PortDeviceSnapshot struct {
+	Port       string `json:"port"`
+	MACAddress string `json:"mac_address"`
+	IPAddress  string `json:"ip_address,omitempty"`
+	Hostname   string `json:"hostname,omitempty"`
+	Vendor     string `json:"vendor,omitempty"`
 }
 
 type ScanProgressStep struct {

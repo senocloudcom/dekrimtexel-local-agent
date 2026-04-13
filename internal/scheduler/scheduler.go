@@ -302,7 +302,21 @@ func (s *Scheduler) executeScan(scanID string, targetSwitchID *int) scanResult {
 			}
 		}
 		if len(targets) == 0 {
-			slog.Error("switch_id not found in config", "id", *targetSwitchID, "scan_id", scanID)
+			// Mogelijk net toegevoegde switch — config is gecached, ververs en probeer opnieuw.
+			slog.Info("switch_id not in cached config, refetching", "id", *targetSwitchID, "scan_id", scanID)
+			if err := s.refetchConfig(); err != nil {
+				slog.Error("config refetch on miss failed", "err", err)
+			} else {
+				for _, sw := range s.config.Switches {
+					if sw.ID == *targetSwitchID {
+						targets = append(targets, sw)
+						break
+					}
+				}
+			}
+		}
+		if len(targets) == 0 {
+			slog.Error("switch_id not found in config (after refetch)", "id", *targetSwitchID, "scan_id", scanID)
 			placeholderID := s.config.Switches[0].ID
 			s.pushStep(scanID, &placeholderID, "scan_complete",
 				fmt.Sprintf("Switch ID %d niet gevonden in agent config", *targetSwitchID), "error")

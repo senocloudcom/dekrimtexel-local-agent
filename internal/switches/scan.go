@@ -100,11 +100,15 @@ func ScanSwitch(sw api.SwitchConfig, creds Credentials, scanID string, progress 
 	if len(commands) == 0 {
 		commands = []string{
 			"show version",
-			"show interfaces status",
+			"show interface status",
 			"show lldp neighbors",
 			"show mac address-table",
 			"show power inline",
 			"show interfaces counters",
+			"show spanning-tree",
+			"show spanning-tree detail",
+			"show vlan",
+			"show interfaces switchport",
 		}
 	}
 

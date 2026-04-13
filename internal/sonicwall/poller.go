@@ -221,6 +221,19 @@ func (p *Poller) pollDevice(d *deviceState) {
 		}
 	}
 
+	// DHCP leases (array response, niet object)
+	dhcpLeases := []map[string]interface{}{}
+	for _, lease := range d.getArray("/reporting/dhcp-server/ipv4/leases/status") {
+		dhcpLeases = append(dhcpLeases, map[string]interface{}{
+			"ip_address":    getString(lease, "ip_address"),
+			"mac_address":   getString(lease, "mac_address"),
+			"host_name":     getString(lease, "host_name"),
+			"vendor":        getString(lease, "vendor"),
+			"lease_expires": getString(lease, "lease_expires"),
+			"type":          getString(lease, "type"),
+		})
+	}
+
 	// HA status
 	if res := d.get("/reporting/status/ha"); res != nil {
 		if state := getString(res, "state"); state != "" {
@@ -243,6 +256,7 @@ func (p *Poller) pollDevice(d *deviceState) {
 		"top_threats": topThreats,
 		"ha_info":     haInfo,
 		"metrics":     metrics,
+		"dhcp_leases": dhcpLeases,
 	}
 
 	if err := p.Client.IngestSonicwall(payload); err != nil {
@@ -337,6 +351,29 @@ func (d *deviceState) get(path string) map[string]interface{} {
 		}
 	}
 	return data
+}
+
+// getArray is voor endpoints die een JSON array teruggeven (bv DHCP leases)
+func (d *deviceState) getArray(path string) []map[string]interface{} {
+	req, err := http.NewRequest("GET", d.url(path), nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := d.httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	if res.StatusCode >= 400 {
+		return nil
+	}
+	var arr []map[string]interface{}
+	if err := json.Unmarshal(b, &arr); err != nil {
+		return nil
+	}
+	return arr
 }
 
 func isSuccess(data map[string]interface{}) bool {

@@ -268,7 +268,7 @@ func cmdScan(args []string) {
 		}
 		result, err := switches.ScanSwitch(sw, creds, scanID, func(step api.ScanProgressStep) {
 			fmt.Printf("  [%s] %s\n", step.Step, step.Detail)
-		})
+		}, nil)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  scan failed: %v\n", err)
 			continue

@@ -131,6 +131,15 @@ func (l *Listener) handleMessage(raw, sourceIP string) {
 
 	l.received.Add(1)
 	parsed := ParseMessage(raw)
+
+	// Debug log elk binnenkomend syslog bericht
+	slog.Info("syslog recv",
+		"src", sourceIP,
+		"mnemonic", parsed.Mnemonic,
+		"sev", parsed.Severity,
+		"iface", parsed.Interface,
+		"msg", truncate(parsed.Message, 120),
+	)
 	ev := api.SyslogEvent{
 		SourceIP:      sourceIP,
 		SwitchName:    parsed.SwitchName,
@@ -212,4 +221,11 @@ func (l *Listener) flush(ctx context.Context) {
 		return
 	}
 	slog.Debug("syslog flush ok", "count", len(events))
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
 }

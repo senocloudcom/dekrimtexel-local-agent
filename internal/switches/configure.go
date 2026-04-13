@@ -22,7 +22,7 @@ type ConfigureResult struct {
 // CBS350 commands:
 //
 //	configure
-//	logging host <syslog_host> port 514 severity <level>
+//	logging host <syslog_host> port 1514 severity <level>
 //	end
 //	write memory
 func ConfigureSyslog(host string, creds Credentials, syslogHost string, syslogLevel string, timeout time.Duration) (string, error) {
@@ -47,7 +47,7 @@ func ConfigureSyslog(host string, creds Credentials, syslogHost string, syslogLe
 
 	commands := []string{
 		"configure",
-		fmt.Sprintf("logging host %s port 514 severity %s", syslogHost, severity),
+		fmt.Sprintf("logging host %s port 1514 severity %s", syslogHost, severity),
 		"end",
 		"write memory",
 	}

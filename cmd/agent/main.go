@@ -25,6 +25,7 @@ import (
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/config"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/scheduler"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
+	"github.com/senocloudcom/dekrimtexel-local-agent/internal/winservice"
 )
 
 // version is injected at build time via -ldflags "-X main.version=..."
@@ -62,6 +63,12 @@ func main() {
 		cmdScan(args)
 	case "run":
 		cmdRun(args)
+	case "install":
+		cmdInstall()
+	case "uninstall":
+		cmdUninstall()
+	case "service":
+		cmdService()
 	case "version", "-v", "--version":
 		fmt.Printf("local-agent %s\n", version)
 	case "help", "-h", "--help":
@@ -83,7 +90,10 @@ Commands:
   pair         Pair with a dashboard using a one-time pairing code
   set-secret   Set the agent secret key (64 hex chars, from dashboard admin UI)
   scan         Run a one-off scan and exit
-  run          Run the agent in the foreground (use this or 'install' as service)
+  run          Run the agent in the foreground (for debug/dev)
+  install      Install as Windows service (admin required)
+  uninstall    Remove the Windows service
+  service      Service entry point — called automatically by Windows SCM
   version      Print version
   help         Print this help
 
@@ -176,33 +186,21 @@ func cmdSetSecret(args []string) {
 	fmt.Println("✓ Ready to start. Run 'local-agent run' to start the agent.")
 }
 
-func cmdRun(_ []string) {
+// runAgent is de gedeelde scheduler setup + loop. Gebruikt door zowel
+// cmdRun (foreground) als cmdService (Windows SCM). Blokkeert tot ctx
+// geannuleerd wordt of de scheduler een fatale fout krijgt.
+func runAgent(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("load config: %w", err)
 	}
-
 	secret, err := config.LoadSecret()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load secret: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("load secret: %w", err)
 	}
 
 	client := api.NewClient(cfg.ServerURL, cfg.APIKey, cfg.TenantID, version)
 	sched := scheduler.NewScheduler(client, cfg.Hostname, cfg.AgentType, version, secret)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle signals
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		slog.Info("signal received, shutting down")
-		cancel()
-	}()
 
 	slog.Info("local-agent starting",
 		"version", version,
@@ -211,8 +209,50 @@ func cmdRun(_ []string) {
 		"hostname", cfg.Hostname,
 	)
 
-	if err := sched.Run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "scheduler: %v\n", err)
+	return sched.Run(ctx)
+}
+
+func cmdRun(_ []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		slog.Info("signal received, shutting down")
+		cancel()
+	}()
+
+	if err := runAgent(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func cmdInstall() {
+	if err := winservice.Install(); err != nil {
+		fmt.Fprintf(os.Stderr, "install service: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ Service geïnstalleerd. Start met: Start-Service DekrimLocalAgent")
+}
+
+func cmdUninstall() {
+	if err := winservice.Uninstall(); err != nil {
+		fmt.Fprintf(os.Stderr, "uninstall service: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ Service verwijderd.")
+}
+
+// cmdService is de entry point wanneer Windows de service start. Niet
+// bedoeld om handmatig te draaien. winservice.Run detecteert of we echt
+// onder de SCM draaien en weigert anders.
+func cmdService() {
+	if err := winservice.Run(runAgent); err != nil {
+		slog.Error("service run failed", "err", err)
+		fmt.Fprintf(os.Stderr, "service: %v\n", err)
 		os.Exit(1)
 	}
 }

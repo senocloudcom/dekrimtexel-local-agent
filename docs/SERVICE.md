@@ -50,33 +50,45 @@ Get-Content C:\ProgramData\dekrimtexel-agent\agent.log -Tail 20
 > `Copy-Item`, wat een "file in use" error geeft. Stop + Copy + Start is
 > deterministisch.
 
-### PowerShell script voor snelle upgrades
+### PowerShell script voor snelle upgrades (aanbevolen)
 
-Plaats dit als `update-agent.ps1` op MONITORING-PC:
+Plaats dit als `C:\Program Files\dekrimtexel-agent\update-agent.ps1`:
 
 ```powershell
-param([Parameter(Mandatory=$true)][string]$NewBinary)
+param([string]$Tag = "latest")
 
-if (-not (Test-Path $NewBinary)) {
-  Write-Error "Binary niet gevonden: $NewBinary"
-  exit 1
+$ErrorActionPreference = "Stop"
+$dir = "C:\Program Files\dekrimtexel-agent"
+$dest = "$dir\local-agent.exe"
+$repo = "senocloudcom/dekrimtexel-local-agent"
+
+if ($Tag -eq "latest") {
+  Write-Host "Fetching latest release tag..."
+  $json = curl.exe -sSL "https://api.github.com/repos/$repo/releases/latest"
+  $Tag = ($json | ConvertFrom-Json).tag_name
 }
+$url = "https://github.com/$repo/releases/download/$Tag/local-agent-windows-amd64.exe"
 
-Write-Host "Stop service..."
-Stop-Service DekrimLocalAgent -Force
+Write-Host "Upgrade naar $Tag..."
+Stop-Service DekrimLocalAgent -Force -ErrorAction SilentlyContinue
+Stop-Process -Name local-agent -Force -ErrorAction SilentlyContinue
+Start-Sleep 2
 
-Write-Host "Binary vervangen..."
-Copy-Item $NewBinary "C:\Program Files\dekrimtexel-agent\local-agent.exe" -Force
+curl.exe -sSL -o $dest $url
+if (-not (Test-Path $dest)) { throw "Download mislukt" }
+& $dest version
 
-Write-Host "Start service..."
 Start-Service DekrimLocalAgent
-
-Start-Sleep -Seconds 3
+Start-Sleep 5
 Get-Service DekrimLocalAgent | Format-List Name, Status, StartType
-Get-Content C:\ProgramData\dekrimtexel-agent\agent.log -Tail 10
+Get-Content "C:\ProgramData\dekrimtexel-agent\logs\agent.log" -Tail 30
 ```
 
-Gebruik: `.\update-agent.ps1 -NewBinary .\local-agent-alpha36.exe`
+Gebruik:
+```powershell
+.\update-agent.ps1                    # laatste release
+.\update-agent.ps1 -Tag v0.1.0-alpha35 # specifieke versie
+```
 
 ## Wijziging in service-definitie
 

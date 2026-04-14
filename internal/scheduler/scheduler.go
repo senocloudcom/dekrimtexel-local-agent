@@ -22,6 +22,7 @@ import (
 
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/api"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/ping"
+	"github.com/senocloudcom/dekrimtexel-local-agent/internal/scanner"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/sonicwall"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/switches"
 	"github.com/senocloudcom/dekrimtexel-local-agent/internal/syslog"
@@ -141,6 +142,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			go s.sendHeartbeat()
 		case <-pollTick.C:
 			go s.pollJobs()
+			go s.pollScannerJobs()
 			// Legacy pollTriggers alleen voor configure actions — scan
 			// triggers gaan via scan_jobs queue (alpha11+). Configure
 			// triggers hebben (nog) geen eigen queue en gebruiken het
@@ -674,4 +676,56 @@ func (s *Scheduler) scanOneSwitch(sw api.SwitchConfig, scanID string) error {
 		return err
 	}
 	return nil
+}
+
+// pollScannerJobs claimt eventuele queued subnet scans en voert ze uit.
+// Eén job tegelijk (scans zijn netwerk-intensief); overige blijven in queue.
+func (s *Scheduler) pollScannerJobs() {
+	jobs, err := s.Client.GetScannerJobs()
+	if err != nil {
+		slog.Debug("scanner jobs fetch failed", "err", err)
+		return
+	}
+	for _, job := range jobs {
+		j := job
+		go s.executeScannerJob(j)
+	}
+}
+
+func (s *Scheduler) executeScannerJob(job api.ScannerJob) {
+	slog.Info("scanner job start", "job_id", job.ID, "run_id", job.RunID, "subnet", job.Subnet, "type", job.ScanType)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	progress := func(step, detail, status string) {
+		// Geen push naar scan_progress tabel (die is per switch_id); we loggen
+		// alleen. Dashboard ziet status via scanner_runs.status transitions.
+		slog.Info("scanner step", "job_id", job.ID, "step", step, "detail", detail, "status", status)
+	}
+
+	result, err := scanner.Run(ctx, job.Subnet, job.ScanType, progress)
+	if err != nil {
+		slog.Error("scanner run failed", "err", err, "job_id", job.ID)
+		_ = s.Client.FinishScannerJob(job.ID, "error", err.Error(), 0, 0)
+		return
+	}
+
+	// Stuur devices in batches van 50 zodat we niet 1 megapayload doen
+	for i := 0; i < len(result.Devices); i += 50 {
+		end := i + 50
+		if end > len(result.Devices) {
+			end = len(result.Devices)
+		}
+		if err := s.Client.IngestScanner(job.RunID, result.Devices[i:end]); err != nil {
+			slog.Error("scanner ingest failed", "err", err, "run_id", job.RunID)
+			_ = s.Client.FinishScannerJob(job.ID, "error", "ingest: "+err.Error(), result.HostsScanned, result.HostsFound)
+			return
+		}
+	}
+
+	if err := s.Client.FinishScannerJob(job.ID, "done", "", result.HostsScanned, result.HostsFound); err != nil {
+		slog.Error("scanner finish failed", "err", err)
+	}
+	slog.Info("scanner job done", "job_id", job.ID, "scanned", result.HostsScanned, "found", result.HostsFound)
 }

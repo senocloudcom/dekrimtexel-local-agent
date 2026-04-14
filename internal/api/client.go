@@ -182,6 +182,34 @@ func (c *Client) IngestPing(results interface{}) error {
 	return c.do("POST", "/v1/ingest/ping", map[string]interface{}{"results": results}, &out)
 }
 
+// GetScannerJobs claimt queued subnet scan jobs van de dashboard.
+func (c *Client) GetScannerJobs() ([]ScannerJob, error) {
+	var out ScannerJobsResponse
+	if err := c.do("GET", "/v1/agent/scanner-jobs", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Jobs, nil
+}
+
+// FinishScannerJob markeert een scanner job als klaar/fout.
+func (c *Client) FinishScannerJob(jobID int, result, errMsg string, hostsScanned, hostsFound int) error {
+	return c.do("POST", fmt.Sprintf("/v1/agent/scanner-jobs/%d/finish", jobID), map[string]interface{}{
+		"result":        result,
+		"error":         errMsg,
+		"hosts_scanned": hostsScanned,
+		"hosts_found":   hostsFound,
+	}, nil)
+}
+
+// IngestScanner stuurt gevonden devices naar dashboard.
+func (c *Client) IngestScanner(runID int, devices interface{}) error {
+	var out IngestResponse
+	return c.do("POST", "/v1/ingest/scanner", map[string]interface{}{
+		"run_id":  runID,
+		"devices": devices,
+	}, &out)
+}
+
 // IngestScanProgress sends just scan progress updates (wraps IngestNetwork with minimal fields).
 // Used for live progress updates during a scan so the dashboard modal can show steps in real time.
 func (c *Client) IngestScanProgress(switchID int, switchName string, steps []ScanProgressStep) error {

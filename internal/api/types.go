@@ -316,3 +316,31 @@ type SyslogEvent struct {
 type SyslogIngestRequest struct {
 	Events []SyslogEvent `json:"events"`
 }
+
+// ScannerJob is één geclaimde subnet scan job.
+type ScannerJob struct {
+	ID       int       `json:"id"`
+	RunID    int       `json:"run_id"`
+	Subnet   string    `json:"subnet"`
+	ScanType string    `json:"scan_type"` // 'quick' | 'full'
+	QueuedAt time.Time `json:"queued_at"`
+}
+
+type ScannerJobsResponse struct {
+	Jobs []ScannerJob `json:"jobs"`
+}
+
+// ScannerOpenPort is één open poort op een device.
+type ScannerOpenPort struct {
+	Port    int    `json:"port"`
+	Service string `json:"service,omitempty"`
+}
+
+// ScannerDevice is één scan-resultaat host.
+type ScannerDevice struct {
+	IPAddress  string            `json:"ip_address"`
+	MACAddress string            `json:"mac_address,omitempty"`
+	Hostname   string            `json:"hostname,omitempty"`
+	Vendor     string            `json:"vendor,omitempty"`
+	OpenPorts  []ScannerOpenPort `json:"open_ports,omitempty"`
+}

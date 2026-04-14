@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+// ArpWakePorts zijn poorten die we parallel TCP-connecten om het OS te
+// dwingen ARP te doen naar het target IP. Het maakt niet uit of de poort
+// open of dicht is — de SYN moet weg, en dat kan alleen als het MAC bekend
+// is, dus het OS stuurt een ARP-request. Na de sweep staat het IP→MAC in
+// de ARP tabel en lezen we die uit.
+//
+// Uitgebreid genoeg om ~elk device te triggeren: Windows (135/139/445/3389),
+// Linux/server (22/80/443), printers (9100/631/80), IoT (23/80/443/554).
+var ArpWakePorts = []int{22, 23, 80, 135, 139, 443, 445, 554, 631, 3389, 8080, 9100}
+
 // CIDRHosts retourneert alle host-IPs in een CIDR (excl. network + broadcast).
 func CIDRHosts(cidr string) ([]string, error) {
 	_, ipnet, err := net.ParseCIDR(cidr)
@@ -21,7 +31,6 @@ func CIDRHosts(cidr string) ([]string, error) {
 	if bits != 32 {
 		return nil, fmt.Errorf("alleen IPv4 /x ondersteund")
 	}
-	// Voorzichtig bij grote subnets — limiet op /16
 	if ones < 16 {
 		return nil, fmt.Errorf("subnet te groot (max /16)")
 	}
@@ -34,7 +43,6 @@ func CIDRHosts(cidr string) ([]string, error) {
 	if len(ips) <= 2 {
 		return ips, nil
 	}
-	// Strip network + broadcast (eerste + laatste)
 	return ips[1 : len(ips)-1], nil
 }
 
@@ -47,20 +55,28 @@ func incIP(ip net.IP) {
 	}
 }
 
-// PingSweep verstuurt een ICMP echo naar elke host in ips en retourneert de
-// set van responders. Parallel (cap 100) via OS ping cmd.
-func PingSweep(ctx context.Context, ips []string, progress func(done, total int)) map[string]bool {
+// DiscoverHosts doet een betrouwbare discovery in 3 fases:
+//  1. Parallelle TCP connect op een set bekende poorten per host (triggert
+//     ARP in het OS, ongeacht of de poort open is of timeout geeft).
+//  2. Parallelle ICMP ping als aanvulling (zie hosts die wel pingbaar maar
+//     geen open poort hebben, zeldzaam maar gratis).
+//  3. Lees `arp -a` en filter op IPs uit dit subnet — dat is de ground truth.
+//
+// Resultaat: set van IPs die bewezen bestaan EN met hun vers opgehaalde MAC.
+// Hosts zonder MAC in de ARP tabel (gateway-routed of niet geantwoord) komen
+// er niet in.
+func DiscoverHosts(ctx context.Context, ips []string, progress func(done, total int)) map[string]string {
+	// Fase 1+2 parallel per host
 	const concurrency = 100
-	responded := make(map[string]bool)
-	var mu sync.Mutex
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var done int
+	var mu sync.Mutex
 
 	for _, ip := range ips {
 		select {
 		case <-ctx.Done():
-			return responded
+			return nil
 		default:
 		}
 		ip := ip
@@ -69,11 +85,9 @@ func PingSweep(ctx context.Context, ips []string, progress func(done, total int)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if pingOne(ctx, ip) {
-				mu.Lock()
-				responded[ip] = true
-				mu.Unlock()
-			}
+			// TCP wake eerst (triggert ARP). ICMP erna (goedkoop).
+			tcpWake(ctx, ip)
+			pingOne(ctx, ip)
 			mu.Lock()
 			done++
 			d := done
@@ -87,17 +101,49 @@ func PingSweep(ctx context.Context, ips []string, progress func(done, total int)
 	if progress != nil {
 		progress(len(ips), len(ips))
 	}
-	return responded
+
+	// Fase 3: lees ARP tabel; alleen IPs uit ons subnet-set behouden
+	ipSet := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		ipSet[ip] = true
+	}
+	out := make(map[string]string)
+	arp := ArpTable(ctx)
+	for ip, mac := range arp {
+		if ipSet[ip] {
+			out[ip] = mac
+		}
+	}
+	return out
 }
 
-// pingOne voert 1 ICMP ping uit via de OS ping cmd. Returns true bij response.
+// tcpWake opent parallel TCP connects naar de wake-poorten. We gooien alle
+// errors weg — het enige doel is dat het OS een ARP-request verstuurt.
+func tcpWake(ctx context.Context, ip string) {
+	var wg sync.WaitGroup
+	for _, port := range ArpWakePorts {
+		port := port
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d := net.Dialer{Timeout: 300 * time.Millisecond}
+			c, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", ip, port))
+			if err == nil {
+				_ = c.Close()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// pingOne voert 1 ICMP ping uit via de OS ping cmd.
 func pingOne(ctx context.Context, ip string) bool {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "ping", "-n", "1", "-w", "800", ip)
+		cmd = exec.CommandContext(ctx, "ping", "-n", "1", "-w", "600", ip)
 	} else {
 		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip)
 	}
@@ -106,6 +152,5 @@ func pingOne(ctx context.Context, ip string) bool {
 		return false
 	}
 	s := strings.ToLower(string(out))
-	// Windows print "Reply from", Unix print "bytes from" bij succes.
 	return strings.Contains(s, "reply from") || strings.Contains(s, "bytes from")
 }

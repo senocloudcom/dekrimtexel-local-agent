@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
@@ -47,7 +48,7 @@ func Install() error {
 		DisplayName:  ServiceDisplayName,
 		Description:  ServiceDescription,
 		StartType:    mgr.StartAutomatic,
-		ServiceType:  svc.ServiceType(0x10), // SERVICE_WIN32_OWN_PROCESS
+		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
 		ErrorControl: mgr.ErrorNormal,
 	}, "service")
 	if err != nil {
